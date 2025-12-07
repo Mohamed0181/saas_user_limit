@@ -8,7 +8,7 @@
     'depends': ['base'],
     'data': [
         'security/ir.model.access.csv',
-        'data/user_limit_data.xml',
+        
     ],
     'auto_install': False,  # تم تغيير التثبيت يدوى مؤقت لحين الانتهاء اً
     'installable': True,
