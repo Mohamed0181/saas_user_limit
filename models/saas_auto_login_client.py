@@ -16,13 +16,11 @@ class SaasAutoLoginController(http.Controller):
     
     @http.route('/saas/generate_auth_link', type='http', auth='none', methods=['POST'], csrf=False)
     def generate_auth_link(self, **kwargs):
-        """توليد رابط تسجيل دخول تلقائي - يقبل JSON عادي"""
+        """توليد رابط تسجيل دخول تلقائي"""
         try:
-            # ✅ قراءة البيانات من request.httprequest.data
+            # قراءة البيانات
             if request.httprequest.data:
                 data = json.loads(request.httprequest.data.decode('utf-8'))
-                
-                # إذا كان JSONRPC format
                 if 'params' in data:
                     params = data['params']
                 else:
@@ -31,7 +29,6 @@ class SaasAutoLoginController(http.Controller):
                 user_id = params.get('user_id')
                 admin_password = params.get('admin_password')
             else:
-                # قراءة من kwargs
                 user_id = kwargs.get('user_id')
                 admin_password = kwargs.get('admin_password')
             
@@ -44,36 +41,48 @@ class SaasAutoLoginController(http.Controller):
                 })
             
             user_id = int(user_id)
+            current_db = request.env.cr.dbname
             
-            # تحقق من كلمة سر الأدمن
-            admin = request.env['res.users'].sudo().search([('login', '=', 'admin')], limit=1)
-            if not admin:
-                _logger.error("❌ Admin user not found")
+            # ✅ التحقق من المستخدم المطلوب
+            user = request.env['res.users'].sudo().browse(user_id)
+            if not user.exists():
+                _logger.error("❌ User ID %d not found in db: %s", user_id, current_db)
                 return request.make_json_response({
                     'success': False, 
-                    'error': 'Admin not found'
+                    'error': f'User ID {user_id} not found'
                 })
             
+            if not user.active:
+                _logger.error("❌ User ID %d is inactive", user_id)
+                return request.make_json_response({
+                    'success': False, 
+                    'error': 'User is inactive'
+                })
+            
+            # ✅ البحث عن مستخدم الأدمن
+            admin = request.env['res.users'].sudo().search([
+                '|', ('login', '=', 'admin'), ('id', '=', 2)
+            ], limit=1)
+            
+            if not admin:
+                _logger.error("❌ Admin user not found in db: %s", current_db)
+                return request.make_json_response({
+                    'success': False, 
+                    'error': 'Admin user not found in database'
+                })
+            
+            # ✅ التحقق من كلمة سر الأدمن
             try:
-                admin.sudo()._check_credentials(admin_password, {'interactive': False})
-                _logger.info("✅ Admin password verified")
+                admin._check_credentials(admin_password, {'interactive': False})
+                _logger.info("✅ Admin password verified in db: %s", current_db)
             except Exception as e:
-                _logger.error("❌ Wrong admin password: %s", str(e))
+                _logger.error("❌ Wrong admin password in db %s: %s", current_db, str(e))
                 return request.make_json_response({
                     'success': False, 
                     'error': 'Wrong admin password'
                 })
             
-            # التحقق من المستخدم
-            user = request.env['res.users'].sudo().browse(user_id)
-            if not user.exists():
-                _logger.error("❌ User not found: %d", user_id)
-                return request.make_json_response({
-                    'success': False, 
-                    'error': 'User not found'
-                })
-            
-            # توليد token آمن
+            # ✅ توليد token آمن
             token = secrets.token_urlsafe(40)
             expires = datetime.now() + timedelta(minutes=10)
             
@@ -82,10 +91,11 @@ class SaasAutoLoginController(http.Controller):
                 'user_id': user_id,
                 'user_login': user.login,
                 'expires': expires,
-                'db_name': request.env.cr.dbname
+                'db_name': current_db
             }
             
-            _logger.info("✅ Token generated for user %s (ID: %d)", user.login, user_id)
+            _logger.info("✅ Token generated for user %s (ID: %d) in db: %s", 
+                        user.login, user_id, current_db)
             
             base = request.httprequest.host_url.rstrip('/')
             auth_url = f"{base}/saas/autologin?token={token}"
@@ -104,7 +114,7 @@ class SaasAutoLoginController(http.Controller):
                 'error': str(e)
             })
 
-    @http.route('/saas/autologin', type='http', auth='none', methods=['GET'], csrf=False)
+    @http.route('/saas/autologin', type='http', auth='public', methods=['GET'], csrf=False)
     def autologin(self, token, **kwargs):
         """تسجيل الدخول التلقائي باستخدام الـ token"""
         try:
@@ -129,6 +139,10 @@ class SaasAutoLoginController(http.Controller):
             user_login = data['user_login']
             db_name = data['db_name']
             
+            _logger.info("🔐 Attempting login for user: %s (ID: %d) in db: %s", 
+                        user_login, user_id, db_name)
+            
+            # التحقق من المستخدم
             user = request.env['res.users'].sudo().browse(user_id)
             if not user.exists() or not user.active:
                 del TOKEN_STORAGE[token]
@@ -137,30 +151,30 @@ class SaasAutoLoginController(http.Controller):
                     'error': 'المستخدم غير موجود أو غير مفعل'
                 })
             
-            # حذف الـ token (استخدام لمرة واحدة فقط)
+            # حذف الـ token
             del TOKEN_STORAGE[token]
             _logger.info("🗑️ Token used and deleted")
             
-            # 🎯 تسجيل الدخول
+            # 🎯 تسجيل الدخول بطريقة Odoo الرسمية
+            request.session.authenticate(db_name, user_login, user_login)
+            
+            # تحديث معلومات الـ session
             request.session.uid = user_id
             request.session.login = user_login
-            request.session.db = db_name
-            request.session.session_token = secrets.token_hex(16)
+            request.session.session_token = request.session.sid
             
-            request.session.context = {
+            # تحديث الـ context
+            request.session.context = dict(request.session.context or {})
+            request.session.context.update({
                 'lang': user.lang or 'en_US',
                 'tz': user.tz or 'UTC',
                 'uid': user_id,
-            }
+            })
             
-            # تحديث environment
-            request.uid = user_id
+            _logger.info("✅✅✅ Autologin SUCCESS for user: %s (ID: %d) in db: %s", 
+                        user_login, user_id, db_name)
             
-            # حفظ الـ session
-            request.session.modified = True
-            
-            _logger.info("✅✅✅ Autologin SUCCESS for user: %s (ID: %d)", user_login, user_id)
-            
+            # إعادة التوجيه للصفحة الرئيسية
             return werkzeug.utils.redirect('/web', 303)
             
         except Exception as e:
