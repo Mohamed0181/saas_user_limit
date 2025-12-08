@@ -3,7 +3,6 @@
 
 from odoo import http
 from odoo.http import request
-from odoo.addons.web.controllers.main import Home
 import logging
 import time
 import werkzeug
@@ -21,73 +20,65 @@ class SaasAutoLoginClientController(http.Controller):
         try:
             _logger.info("🔐 Received auto-login request with token: %s...", token[:10])
 
-            # الحصول على db من الـ request
+            # الحصول على db name
             db_name = request.session.db or request.db
             
-            # إنشاء registry و cursor
-            registry = http.Registry(db_name)
-            with registry.cursor() as cr:
-                env = http.Environment(cr, http.SUPERUSER_ID, {})
-                
-                # البحث عن الـ token في ir.config_parameter
-                token_key = f'saas_auto_login_token_{token}'
-                token_data = env['ir.config_parameter'].get_param(token_key)
+            if not db_name:
+                return self._error_response('Database not found')
+            
+            # إنشاء environment مع SUPERUSER
+            uid = http.SUPERUSER_ID
+            env = request.env(user=uid)
+            
+            # البحث عن الـ token
+            token_key = f'saas_auto_login_token_{token}'
+            token_data = env['ir.config_parameter'].sudo().get_param(token_key)
 
-                if not token_data:
-                    _logger.error("❌ Token not found or expired: %s", token_key)
-                    return self._error_response('Invalid or expired token')
+            if not token_data:
+                _logger.error("❌ Token not found: %s", token_key)
+                return self._error_response('Invalid or expired token')
 
-                # فك تشفير الـ token: user_id|expiry_timestamp
-                try:
-                    user_id, expiry = token_data.split('|')
-                    user_id = int(user_id)
-                    expiry = int(expiry)
+            # فك تشفير الـ token
+            try:
+                user_id, expiry = token_data.split('|')
+                user_id = int(user_id)
+                expiry = int(expiry)
 
-                    # تحقق من انتهاء الصلاحية
-                    current_time = int(time.time())
-                    if current_time > expiry:
-                        _logger.error("❌ Token expired")
-                        env['ir.config_parameter'].set_param(token_key, False)
-                        cr.commit()
-                        return self._error_response('Token expired. Please try again.')
+                # تحقق من انتهاء الصلاحية
+                if int(time.time()) > expiry:
+                    _logger.error("❌ Token expired")
+                    env['ir.config_parameter'].sudo().set_param(token_key, False)
+                    env.cr.commit()
+                    return self._error_response('Token expired. Please try again.')
 
-                except ValueError as e:
-                    _logger.error("❌ Invalid token format: %s", str(e))
-                    return self._error_response('Invalid token format')
+            except ValueError:
+                return self._error_response('Invalid token format')
 
-                # البحث عن المستخدم
-                user = env['res.users'].browse(user_id)
-                if not user.exists():
-                    _logger.error("❌ User not found: ID %s", user_id)
-                    return self._error_response('User not found')
+            # البحث عن المستخدم
+            user = env['res.users'].sudo().browse(user_id)
+            
+            if not user.exists() or not user.active:
+                _logger.error("❌ User not found or inactive: ID %s", user_id)
+                return self._error_response('User not found or inactive')
 
-                if not user.active:
-                    _logger.error("❌ User inactive: %s", user.login)
-                    return self._error_response('User is inactive')
+            _logger.info("✅ User validated: %s (ID: %s)", user.login, user.id)
 
-                _logger.info("✅ Token validated for user: %s (ID: %s)", user.login, user.id)
+            # حذف الـ token
+            env['ir.config_parameter'].sudo().set_param(token_key, False)
+            env.cr.commit()
 
-                # حذف الـ token بعد الاستخدام
-                env['ir.config_parameter'].set_param(token_key, False)
-                cr.commit()
+            # تسجيل الدخول
+            request.session.uid = user_id
+            request.session.login = user.login
+            request.session.session_token = request.session.sid
+            
+            # تحديث context
+            request.uid = user_id
+            request.session.context = request.env['res.users'].sudo().browse(user_id).context_get()
+            
+            _logger.info("✅ Login successful for: %s", user.login)
 
-                # ✨ الحل النهائي: إنشاء session جديدة
-                request.session.logout(keep_db=True)
-                
-                # تسجيل الدخول باستخدام uid مباشرة
-                request.session.uid = user_id
-                request.session.login = user.login
-                request.session.db = db_name
-                
-                # الحصول على context
-                with registry.cursor() as cr2:
-                    env2 = http.Environment(cr2, user_id, {})
-                    context = env2['res.users'].context_get()
-                    request.session.context = context
-                
-                _logger.info("✅ Session created successfully for user: %s", user.login)
-
-            # إعادة توجيه للصفحة الرئيسية
+            # Redirect
             return werkzeug.utils.redirect('/web')
 
         except Exception as e:
@@ -121,17 +112,6 @@ class SaasAutoLoginClientController(http.Controller):
                     display: inline-block;
                     box-shadow: 0 10px 40px rgba(0,0,0,0.2);
                     max-width: 500px;
-                    animation: slideIn 0.3s ease-out;
-                }}
-                @keyframes slideIn {{
-                    from {{
-                        transform: translateY(-20px);
-                        opacity: 0;
-                    }}
-                    to {{
-                        transform: translateY(0);
-                        opacity: 1;
-                    }}
                 }}
                 .error-icon {{
                     font-size: 60px;
@@ -140,28 +120,18 @@ class SaasAutoLoginClientController(http.Controller):
                 h2 {{ 
                     margin: 0 0 15px 0;
                     color: #333;
-                    font-size: 24px;
                 }}
                 p {{
                     color: #666;
-                    font-size: 16px;
-                    line-height: 1.6;
                     margin: 0 0 25px 0;
                 }}
                 .retry {{
-                    margin-top: 20px;
                     padding: 12px 30px;
                     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                     color: white;
                     text-decoration: none;
                     border-radius: 25px;
                     display: inline-block;
-                    font-weight: 600;
-                    transition: transform 0.2s, box-shadow 0.2s;
-                }}
-                .retry:hover {{
-                    transform: translateY(-2px);
-                    box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
                 }}
             </style>
         </head>
