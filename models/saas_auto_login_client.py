@@ -173,11 +173,11 @@ class SaasAutoLoginController(http.Controller):
                 'uid': user_id,
             }
             
-            # الخطوة 5: حفظ الـ session
-            request.session.finalize()
-            
-            # الخطوة 6: تحديث الـ environment
+            # الخطوة 5: تحديث الـ environment أولاً
             request.update_env(user=user_id)
+            
+            # الخطوة 6: حفظ الـ session (يحتاج env)
+            request.session.finalize(request.env)
             
             _logger.info("✅✅✅ Autologin SUCCESS for user: %s (ID: %d)", user_login, user_id)
             
