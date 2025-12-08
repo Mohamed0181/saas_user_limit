@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # saas_auto_login_client/controllers/main.py
 
-from odoo import http
+from odoo import http, SUPERUSER_ID
 from odoo.http import request
 import logging
 import time
@@ -12,26 +12,17 @@ _logger = logging.getLogger(__name__)
 
 class SaasAutoLoginClientController(http.Controller):
 
-    @http.route('/saas/client_login/<string:token>', type='http', auth='none', csrf=False, website=False)
+    @http.route('/saas/client_login/<string:token>', type='http', auth='public', csrf=False, website=False)
     def client_auto_login(self, token, **kwargs):
         """
         تسجيل دخول تلقائي باستخدام token مؤقت
         """
         try:
             _logger.info("🔐 Received auto-login request with token: %s...", token[:10])
-
-            # الحصول على db name
-            db_name = request.session.db or request.db
-            
-            if not db_name:
-                return self._error_response('Database not found')
-            
-            # إنشاء environment مع SUPERUSER
-            env = request.env
             
             # البحث عن الـ token
             token_key = f'saas_auto_login_token_{token}'
-            token_data = env['ir.config_parameter'].sudo().get_param(token_key)
+            token_data = request.env['ir.config_parameter'].sudo().get_param(token_key)
 
             if not token_data:
                 _logger.error("❌ Token not found: %s", token_key)
@@ -46,15 +37,14 @@ class SaasAutoLoginClientController(http.Controller):
                 # تحقق من انتهاء الصلاحية
                 if int(time.time()) > expiry:
                     _logger.error("❌ Token expired")
-                    env['ir.config_parameter'].sudo().set_param(token_key, False)
-                    env.cr.commit()
+                    request.env['ir.config_parameter'].sudo().set_param(token_key, False)
                     return self._error_response('Token expired. Please try again.')
 
             except ValueError:
                 return self._error_response('Invalid token format')
 
             # البحث عن المستخدم
-            user = env['res.users'].sudo().browse(user_id)
+            user = request.env['res.users'].sudo().browse(user_id)
             
             if not user.exists() or not user.active:
                 _logger.error("❌ User not found or inactive: ID %s", user_id)
@@ -63,17 +53,16 @@ class SaasAutoLoginClientController(http.Controller):
             _logger.info("✅ User validated: %s (ID: %s)", user.login, user.id)
 
             # حذف الـ token
-            env['ir.config_parameter'].sudo().set_param(token_key, False)
-            env.cr.commit()
+            request.env['ir.config_parameter'].sudo().set_param(token_key, False)
 
-            # تسجيل الدخول
+            # ✨ الحل الصحيح: استخدام update_env
+            request.update_env(user=user_id)
+            
+            # تحديث الـ session
             request.session.uid = user_id
             request.session.login = user.login
             request.session.session_token = request.session.sid
-            
-            # تحديث context
-            request.uid = user_id
-            request.session.context = request.env['res.users'].sudo().browse(user_id).context_get()
+            request.session.context = request.env.context
             
             _logger.info("✅ Login successful for: %s", user.login)
 
