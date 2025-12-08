@@ -25,17 +25,15 @@ class SaasAutoLoginClientController(http.Controller):
 
             _logger.info("📊 Using DB: %s", db_name)
 
-            # Get registry (Odoo 18 way)
+            # Registry loader for Odoo 18
             import odoo
-            from odoo.modules.registry import Registry
-
             try:
-                registry = Registry(db_name)
+                registry = odoo.modules.registry.Registry(db_name)
             except Exception as e:
-                _logger.error("❌ Registry error: %s", str(e))
+                _logger.error("❌ Registry load failed: %s", str(e))
                 return self._error_response(f"Database error: {str(e)}", show_login=True)
 
-            # Read token
+            # Read token from DB
             with registry.cursor() as cr:
                 env = odoo.api.Environment(cr, odoo.SUPERUSER_ID, {})
 
@@ -45,6 +43,7 @@ class SaasAutoLoginClientController(http.Controller):
                 if not token_data:
                     return self._error_response("Invalid or expired token", show_login=True)
 
+                # Decode token: "user_id|expiry"
                 try:
                     user_id, expiry = token_data.split('|')
                     user_id = int(user_id)
@@ -53,6 +52,7 @@ class SaasAutoLoginClientController(http.Controller):
                     env["ir.config_parameter"].sudo().set_param(token_key, False)
                     return self._error_response("Invalid token format", show_login=True)
 
+                # Expired?
                 if time.time() > expiry:
                     env["ir.config_parameter"].sudo().set_param(token_key, False)
                     return self._error_response("Token expired, please regenerate", show_login=True)
@@ -64,13 +64,12 @@ class SaasAutoLoginClientController(http.Controller):
                 if not user.active:
                     return self._error_response("Inactive user", show_login=True)
 
-                # Delete token for security
+                # Remove token (one-time use)
                 env["ir.config_parameter"].sudo().set_param(token_key, False)
                 cr.commit()
 
-            # Create session
+            # Create session safely
             self._create_user_session(env, user)
-
 
             return werkzeug.utils.redirect("/web")
 
@@ -79,7 +78,7 @@ class SaasAutoLoginClientController(http.Controller):
             return self._error_response(str(e), show_login=True)
 
     # ----------------------------------------------------------------------
-    # DB Resolver
+    # Detect DB
     # ----------------------------------------------------------------------
     def _ensure_db(self):
         db = request.session.db if hasattr(request, "session") else None
@@ -99,30 +98,29 @@ class SaasAutoLoginClientController(http.Controller):
         return db
 
     # ----------------------------------------------------------------------
-    # Create Session (Compatible with Odoo 17 & 18)
+    # Create Session (Odoo 17 & 18 Safe)
     # ----------------------------------------------------------------------
     def _create_user_session(self, env, user):
-    """Create Odoo 18 session WITHOUT opening a new cursor"""
+        """Create session without cursor issues (Odoo 18 compatible)."""
 
-    request.session.clear()
+        request.session.clear()
 
-    request.session.db = env.cr.dbname
-    request.session.uid = user.id
-    request.session.login = user.login
+        request.session.db = env.cr.dbname
+        request.session.uid = user.id
+        request.session.login = user.login
 
-    try:
-        ctx = user.context_get()
-        request.session.context = ctx
-    except Exception as e:
-        _logger.warning("⚠️ Failed to load context: %s", str(e))
-        request.session.context = {
-            "lang": "en_US",
-            "tz": "UTC",
-            "uid": user.id,
-        }
+        try:
+            ctx = user.context_get()
+            request.session.context = ctx
+        except Exception as e:
+            _logger.warning("⚠️ Failed to load context: %s", str(e))
+            request.session.context = {
+                "lang": "en_US",
+                "tz": "UTC",
+                "uid": user.id,
+            }
 
-    _logger.info("✅ Session created successfully for user: %s", user.login)
-
+        _logger.info("✅ Session created successfully for user: %s", user.login)
 
     # ----------------------------------------------------------------------
     # Error Page
