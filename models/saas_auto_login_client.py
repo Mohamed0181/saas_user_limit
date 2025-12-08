@@ -41,22 +41,41 @@ class SaasClientLoginController(http.Controller):
             user = result['user']
             
             try:
-                # ✅ الطريقة الصحيحة لـ Odoo 18
-                request.session.uid = user.id
-                request.session.login = user.login
-                request.session.session_token = request.session.sid
+                # ✅ الحصول على database name
+                db_name = request.env.cr.dbname
                 
-                # تحديث الـ context
-                user_context = request.env['res.users'].sudo().browse(user.id).context_get()
-                request.session.context = dict(user_context)
+                _logger.info("🔑 Attempting to authenticate user: %s (ID: %s) in DB: %s", 
+                            user.login, user.id, db_name)
                 
-                # تحديث الـ environment
-                request.update_env(user=user.id)
+                # ✅ الطريقة الصحيحة لـ Odoo 18 - إنشاء session جديد
+                request.session.authenticate(db_name, user.login, user.id)
                 
-                _logger.info("✅ User logged in successfully: %s (ID: %s)", user.login, user.id)
+                # ✅ حفظ الـ session بشكل صريح
+                request.session.save()
+                
+                _logger.info("✅ Session created successfully for user: %s", user.login)
                 
                 # تحديث last login
                 user.sudo().write({'login_date': fields.Datetime.now()})
+
+            except AttributeError:
+                # ✅ Fallback للطريقة اليدوية إذا فشلت authenticate
+                _logger.warning("⚠️ Using fallback session creation method")
+                
+                # طريقة يدوية لإنشاء الـ session
+                request.session.uid = user.id
+                request.session.login = user.login
+                request.session.session_token = request.session.sid
+                request.session.db = request.env.cr.dbname
+                
+                # تحديث الـ context
+                user_context = request.env['res.users'].sudo().browse(user.id).context_get()
+                request.session.context = dict(user_context) if user_context else {}
+                
+                # حفظ الـ session
+                request.session.save()
+                
+                _logger.info("✅ Fallback session created for user: %s", user.login)
 
             except Exception as e:
                 _logger.error("❌ Failed to create session: %s", str(e), exc_info=True)
@@ -274,7 +293,8 @@ class SaasClientLoginController(http.Controller):
             html_content,
             headers=[
                 ('Content-Type', 'text/html; charset=utf-8'),
-                ('Cache-Control', 'no-cache, no-store, must-revalidate')
+                ('Cache-Control', 'no-cache, no-store, must-revalidate'),
+                ('Set-Cookie', f'session_id={request.session.sid}; Path=/; HttpOnly; SameSite=Lax')
             ]
         )
 
