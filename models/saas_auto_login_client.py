@@ -69,7 +69,8 @@ class SaasAutoLoginClientController(http.Controller):
                 cr.commit()
 
             # Create session
-            self._create_user_session(db_name, user_id, user.login, registry)
+            self._create_user_session(env, user)
+
 
             return werkzeug.utils.redirect("/web")
 
@@ -100,26 +101,28 @@ class SaasAutoLoginClientController(http.Controller):
     # ----------------------------------------------------------------------
     # Create Session (Compatible with Odoo 17 & 18)
     # ----------------------------------------------------------------------
-    def _create_user_session(self, db, uid, login, registry):
-        import odoo
+    def _create_user_session(self, env, user):
+    """Create Odoo 18 session WITHOUT opening a new cursor"""
 
-        if not hasattr(request, "session"):
-            raise Exception("No session object")
+    request.session.clear()
 
-        request.session.clear()
-        request.session.db = db
-        request.session.uid = uid
-        request.session.login = login
+    request.session.db = env.cr.dbname
+    request.session.uid = user.id
+    request.session.login = user.login
 
-        with registry.cursor() as cr:
-            env = odoo.api.Environment(cr, uid, {})
-            try:
-                ctx = env["res.users"].context_get()
-                request.session.context = ctx
-            except:
-                request.session.context = {"lang": "en_US", "tz": "UTC", "uid": uid}
+    try:
+        ctx = user.context_get()
+        request.session.context = ctx
+    except Exception as e:
+        _logger.warning("⚠️ Failed to load context: %s", str(e))
+        request.session.context = {
+            "lang": "en_US",
+            "tz": "UTC",
+            "uid": user.id,
+        }
 
-        _logger.info("✅ Session started for %s", login)
+    _logger.info("✅ Session created successfully for user: %s", user.login)
+
 
     # ----------------------------------------------------------------------
     # Error Page
