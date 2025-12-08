@@ -3,6 +3,7 @@
 
 from odoo import http
 from odoo.http import request
+from odoo.addons.web.controllers.main import Home
 import logging
 import time
 import werkzeug
@@ -12,71 +13,88 @@ _logger = logging.getLogger(__name__)
 
 class SaasAutoLoginClientController(http.Controller):
 
-    @http.route('/saas/client_login/<string:token>', type='http', auth='public', csrf=False, website=False)
+    @http.route('/saas/client_login/<string:token>', type='http', auth='none', csrf=False, website=False)
     def client_auto_login(self, token, **kwargs):
         """
         تسجيل دخول تلقائي باستخدام token مؤقت
         """
+        # تأكد من وجود db في الـ session
+        ensure_db()
+        
         try:
             _logger.info("🔐 Received auto-login request with token: %s...", token[:10])
             
-            # البحث عن الـ token
-            token_key = f'saas_auto_login_token_{token}'
-            token_data = request.env['ir.config_parameter'].sudo().get_param(token_key)
-
-            if not token_data:
-                _logger.error("❌ Token not found: %s", token_key)
-                return self._error_response('Invalid or expired token')
-
-            # فك تشفير الـ token
-            try:
-                user_id, expiry = token_data.split('|')
-                user_id = int(user_id)
-                expiry = int(expiry)
-
-                # تحقق من انتهاء الصلاحية
-                if int(time.time()) > expiry:
-                    _logger.error("❌ Token expired")
-                    request.env['ir.config_parameter'].sudo().set_param(token_key, False)
-                    return self._error_response('Token expired. Please try again.')
-
-            except ValueError:
-                return self._error_response('Invalid token format')
-
-            # البحث عن المستخدم
-            user = request.env['res.users'].sudo().browse(user_id)
+            # إنشاء registry و cursor للوصول لقاعدة البيانات
+            db_name = request.session.db
+            if not db_name:
+                db_name = request.db
+                
+            import odoo
+            registry = odoo.registry(db_name)
             
-            if not user.exists() or not user.active:
-                _logger.error("❌ User not found or inactive: ID %s", user_id)
-                return self._error_response('User not found or inactive')
+            with registry.cursor() as cr:
+                # إنشاء environment مع SUPERUSER_ID
+                from odoo import SUPERUSER_ID
+                env = odoo.api.Environment(cr, SUPERUSER_ID, {})
+                
+                # البحث عن الـ token
+                token_key = f'saas_auto_login_token_{token}'
+                token_data = env['ir.config_parameter'].get_param(token_key)
 
-            _logger.info("✅ User validated: %s (ID: %s)", user.login, user.id)
+                if not token_data:
+                    _logger.error("❌ Token not found: %s", token_key)
+                    return self._error_response('Invalid or expired token')
 
-            # حذف الـ token
-            request.env['ir.config_parameter'].sudo().set_param(token_key, False)
+                # فك تشفير الـ token
+                try:
+                    user_id, expiry = token_data.split('|')
+                    user_id = int(user_id)
+                    expiry = int(expiry)
 
-            # ✨ الحل النهائي: تحديث session مباشرة
+                    # تحقق من انتهاء الصلاحية
+                    if int(time.time()) > expiry:
+                        _logger.error("❌ Token expired")
+                        env['ir.config_parameter'].set_param(token_key, False)
+                        cr.commit()
+                        return self._error_response('Token expired. Please try again.')
+
+                except ValueError:
+                    return self._error_response('Invalid token format')
+
+                # البحث عن المستخدم
+                user = env['res.users'].browse(user_id)
+                
+                if not user.exists() or not user.active:
+                    _logger.error("❌ User not found or inactive: ID %s", user_id)
+                    return self._error_response('User not found or inactive')
+
+                _logger.info("✅ User validated: %s (ID: %s)", user.login, user.id)
+
+                # حذف الـ token
+                env['ir.config_parameter'].set_param(token_key, False)
+                cr.commit()
+                
+            # ✨ الحل الصحيح: إنشاء session جديدة تماماً
+            # مسح الـ session القديمة
+            old_session = dict(request.session)
+            request.session.clear()
+            
+            # إعادة db name
+            request.session.db = db_name
+            
+            # تعيين user
             request.session.uid = user_id
             request.session.login = user.login
-            request.session.db = request.db
-            request.session.session_token = request.session.sid
             
-            # تحديث context
-            request.session.context = {
-                'lang': user.lang,
-                'tz': user.tz,
-                'uid': user_id,
-            }
+            # الحصول على context جديد
+            with registry.cursor() as cr:
+                env = odoo.api.Environment(cr, user_id, {})
+                request.session.context = dict(env['res.users'].context_get())
+                
+            _logger.info("✅ Session created for user: %s", user.login)
             
-            _logger.info("✅ Session updated - UID: %s, Login: %s", user_id, user.login)
-            
-            # Redirect مع معلومات الـ session
-            response = werkzeug.utils.redirect('/web')
-            
-            # إضافة session_id للـ cookie
-            response.set_cookie('session_id', request.session.sid)
-            
-            return response
+            # Redirect
+            return werkzeug.utils.redirect('/web')
 
         except Exception as e:
             _logger.error("❌ Auto-login failed: %s", str(e), exc_info=True)
@@ -143,3 +161,9 @@ class SaasAutoLoginClientController(http.Controller):
         </html>
         """
         return request.make_response(html_content, headers=[('Content-Type', 'text/html')])
+
+
+def ensure_db():
+    """التأكد من وجود database في الـ session"""
+    if not request.session.db and request.db:
+        request.session.db = request.db
