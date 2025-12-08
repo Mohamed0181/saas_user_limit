@@ -70,8 +70,8 @@ class SaasAutoLoginClientController(http.Controller):
             # حفظ context المستخدم
             request.session.context = dict(request.env['res.users'].sudo().browse(user_id).context_get())
             
-            # حفظ الـ session
-            request.session.save()
+            # وضع علامة modified لحفظ التغييرات
+            request.session.modified = True
             
             _logger.info("✅ Login successful for: %s", user.login)
 
