@@ -5,6 +5,7 @@ from odoo import http
 from odoo.http import request
 import logging
 import time
+import werkzeug
 
 _logger = logging.getLogger(__name__)
 
@@ -61,17 +62,28 @@ class SaasAutoLoginClientController(http.Controller):
             # حذف الـ token بعد الاستخدام (one-time use)
             ICPSudo.set_param(token_key, False)
 
-            # تسجيل الدخول مباشرة
+            # ✨ التعديل الأساسي: تسجيل الدخول التلقائي بدون username/password
+            # إنشاء session جديدة للمستخدم
+            request.session.authenticate(request.db, login=user.login, password=None, uid=user.id)
+            
+            # تحديث بيانات الـ session
             request.session.uid = user.id
             request.session.login = user.login
             request.session.session_token = request.session.sid
-            request.session.context = request.env['res.users'].context_get()
+            
+            # تحديث الـ context
+            request.session.context = dict(request.env['res.users'].sudo().browse(user.id).context_get())
+            
+            # تحديث آخر تسجيل دخول
+            user.sudo().write({'login_date': fields.Datetime.now()})
+
+            _logger.info("✅ Session created successfully for user: %s", user.login)
 
             # إعادة توجيه للصفحة الرئيسية
-            return request.redirect('/web')
+            return werkzeug.utils.redirect('/web')
 
         except Exception as e:
-            _logger.error("❌ Auto-login failed: %s", str(e))
+            _logger.error("❌ Auto-login failed: %s", str(e), exc_info=True)
             return self._error_response(f'Login failed: {str(e)}')
 
     def _error_response(self, message):
@@ -84,38 +96,71 @@ class SaasAutoLoginClientController(http.Controller):
             <title>Auto Login Error</title>
             <style>
                 body {{
-                    font-family: Arial, sans-serif;
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
                     text-align: center;
                     padding: 50px;
-                    background: #f5f5f5;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    margin: 0;
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
                 }}
                 .error {{
-                    background: #f8d7da;
-                    color: #721c24;
-                    padding: 30px;
-                    border-radius: 8px;
+                    background: white;
+                    padding: 40px;
+                    border-radius: 15px;
                     display: inline-block;
-                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.2);
                     max-width: 500px;
+                    animation: slideIn 0.3s ease-out;
                 }}
-                h2 {{ margin-top: 0; }}
+                @keyframes slideIn {{
+                    from {{
+                        transform: translateY(-20px);
+                        opacity: 0;
+                    }}
+                    to {{
+                        transform: translateY(0);
+                        opacity: 1;
+                    }}
+                }}
+                .error-icon {{
+                    font-size: 60px;
+                    margin-bottom: 20px;
+                }}
+                h2 {{ 
+                    margin: 0 0 15px 0;
+                    color: #333;
+                    font-size: 24px;
+                }}
+                p {{
+                    color: #666;
+                    font-size: 16px;
+                    line-height: 1.6;
+                    margin: 0 0 25px 0;
+                }}
                 .retry {{
                     margin-top: 20px;
-                    padding: 10px 20px;
-                    background: #007bff;
+                    padding: 12px 30px;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                     color: white;
                     text-decoration: none;
-                    border-radius: 5px;
+                    border-radius: 25px;
                     display: inline-block;
+                    font-weight: 600;
+                    transition: transform 0.2s, box-shadow 0.2s;
                 }}
                 .retry:hover {{
-                    background: #0056b3;
+                    transform: translateY(-2px);
+                    box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
                 }}
             </style>
         </head>
         <body>
             <div class="error">
-                <h2>❌ Auto Login Failed</h2>
+                <div class="error-icon">❌</div>
+                <h2>Auto Login Failed</h2>
                 <p>{message}</p>
                 <a href="/web/login" class="retry">Go to Login Page</a>
             </div>
