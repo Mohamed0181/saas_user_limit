@@ -3,6 +3,7 @@ from odoo import http
 from odoo.http import request
 import logging
 import time
+import werkzeug
 
 _logger = logging.getLogger(__name__)
 
@@ -66,17 +67,41 @@ class SaasClientLoginController(http.Controller):
             IrConfigParameter.set_param(token_key, False)
             _logger.info("🗑️ Token deleted after use")
 
-            # تسجيل الدخول
-            request.session.authenticate(
-                request.env.cr.dbname,
-                user.login,
-                user.id,  # استخدام user.id بدلاً من password
+            # ✅ الحل الصحيح: إنشاء session جديدة
+            # نحتاج لإنشاء session وتسجيل الدخول بشكل صحيح
+            
+            # 1. إنشاء session جديدة
+            request.session.logout(keep_db=True)
+            
+            # 2. تسجيل الدخول باستخدام uid مباشرة
+            request.session.uid = user_id
+            request.session.login = user.login
+            request.session.session_token = request.session.sid
+            
+            # 3. تحديث الـ context
+            request.session.context = request.env['res.users'].context_get()
+            
+            # 4. حفظ الـ session
+            request.session.touch()
+            
+            _logger.info("✅ Session created successfully for user: %s", user.login)
+            
+            # 5. Update user's login date
+            user.sudo().write({'login_date': http.fields.Datetime.now()})
+
+            # 6. إعادة التوجيه للـ dashboard
+            response = werkzeug.utils.redirect('/web')
+            
+            # إضافة session cookie
+            response.set_cookie(
+                'session_id',
+                request.session.sid,
+                max_age=90 * 24 * 60 * 60,  # 90 days
+                httponly=True,
+                secure=False  # True if using HTTPS
             )
-
-            _logger.info("✅ User logged in successfully: %s", user.login)
-
-            # إعادة التوجيه للـ dashboard
-            return http.redirect_with_hash('/web')
+            
+            return response
 
         except Exception as e:
             _logger.error("❌ Client auto-login failed: %s", str(e), exc_info=True)
