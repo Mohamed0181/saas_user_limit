@@ -63,19 +63,22 @@ class SaasAutoLoginClientController(http.Controller):
             ICPSudo.set_param(token_key, False)
 
             # ✨ التعديل الأساسي: تسجيل الدخول التلقائي بدون username/password
-            # إنشاء session جديدة للمستخدم
-            request.session.authenticate(request.db, login=user.login, password=None, uid=user.id)
-            
-            # تحديث بيانات الـ session
+            # تعيين بيانات الـ session مباشرة
             request.session.uid = user.id
             request.session.login = user.login
             request.session.session_token = request.session.sid
+            request.session.db = request.db
             
-            # تحديث الـ context
-            request.session.context = dict(request.env['res.users'].sudo().browse(user.id).context_get())
+            # تحديث الـ context من المستخدم
+            context = request.env['res.users'].sudo().browse(user.id).context_get()
+            request.session.context = dict(context)
             
             # تحديث آخر تسجيل دخول
-            user.sudo().write({'login_date': fields.Datetime.now()})
+            try:
+                from odoo import fields
+                user.sudo().write({'login_date': fields.Datetime.now()})
+            except:
+                pass  # في حالة عدم وجود حقل login_date
 
             _logger.info("✅ Session created successfully for user: %s", user.login)
 
