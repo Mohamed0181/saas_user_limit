@@ -27,8 +27,7 @@ class SaasAutoLoginClientController(http.Controller):
                 return self._error_response('Database not found')
             
             # إنشاء environment مع SUPERUSER
-            uid = http.SUPERUSER_ID
-            env = request.env(user=uid)
+            env = request.env
             
             # البحث عن الـ token
             token_key = f'saas_auto_login_token_{token}'
