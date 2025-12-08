@@ -3,6 +3,7 @@
 
 from odoo import http
 from odoo.http import request
+from odoo.addons.web.controllers.main import Home
 import logging
 import time
 import werkzeug
@@ -12,7 +13,7 @@ _logger = logging.getLogger(__name__)
 
 class SaasAutoLoginClientController(http.Controller):
 
-    @http.route('/saas/client_login/<string:token>', type='http', auth='public', csrf=False, website=False)
+    @http.route('/saas/client_login/<string:token>', type='http', auth='none', csrf=False, website=False)
     def client_auto_login(self, token, **kwargs):
         """
         تسجيل دخول تلقائي باستخدام token مؤقت
@@ -20,67 +21,71 @@ class SaasAutoLoginClientController(http.Controller):
         try:
             _logger.info("🔐 Received auto-login request with token: %s...", token[:10])
 
-            # البحث عن الـ token في ir.config_parameter
-            ICPSudo = request.env['ir.config_parameter'].sudo()
-            token_key = f'saas_auto_login_token_{token}'
-            token_data = ICPSudo.get_param(token_key)
-
-            if not token_data:
-                _logger.error("❌ Token not found or expired: %s", token_key)
-                return self._error_response('Invalid or expired token')
-
-            # فك تشفير الـ token: user_id|expiry_timestamp
-            try:
-                user_id, expiry = token_data.split('|')
-                user_id = int(user_id)
-                expiry = int(expiry)
-
-                # تحقق من انتهاء الصلاحية
-                current_time = int(time.time())
-                if current_time > expiry:
-                    _logger.error("❌ Token expired: %s (expired at: %s, now: %s)", token_key, expiry, current_time)
-                    # حذف الـ token المنتهي
-                    ICPSudo.set_param(token_key, False)
-                    return self._error_response('Token expired. Please try again.')
-
-            except ValueError as e:
-                _logger.error("❌ Invalid token format: %s", str(e))
-                return self._error_response('Invalid token format')
-
-            # البحث عن المستخدم
-            user = request.env['res.users'].sudo().browse(user_id)
-            if not user.exists():
-                _logger.error("❌ User not found: ID %s", user_id)
-                return self._error_response('User not found')
-
-            if not user.active:
-                _logger.error("❌ User inactive: %s", user.login)
-                return self._error_response('User is inactive')
-
-            _logger.info("✅ Auto-login successful for user: %s (ID: %s)", user.login, user.id)
-
-            # حذف الـ token بعد الاستخدام (one-time use)
-            ICPSudo.set_param(token_key, False)
-
-            # ✨ التعديل الأساسي: تسجيل الدخول التلقائي بدون username/password
-            # تعيين بيانات الـ session مباشرة
-            request.session.uid = user.id
-            request.session.login = user.login
-            request.session.session_token = request.session.sid
-            request.session.db = request.db
+            # الحصول على db من الـ request
+            db_name = request.session.db or request.db
             
-            # تحديث الـ context من المستخدم
-            context = request.env['res.users'].sudo().browse(user.id).context_get()
-            request.session.context = dict(context)
-            
-            # تحديث آخر تسجيل دخول
-            try:
-                from odoo import fields
-                user.sudo().write({'login_date': fields.Datetime.now()})
-            except:
-                pass  # في حالة عدم وجود حقل login_date
+            # إنشاء registry و cursor
+            registry = http.Registry(db_name)
+            with registry.cursor() as cr:
+                env = http.Environment(cr, http.SUPERUSER_ID, {})
+                
+                # البحث عن الـ token في ir.config_parameter
+                token_key = f'saas_auto_login_token_{token}'
+                token_data = env['ir.config_parameter'].get_param(token_key)
 
-            _logger.info("✅ Session created successfully for user: %s", user.login)
+                if not token_data:
+                    _logger.error("❌ Token not found or expired: %s", token_key)
+                    return self._error_response('Invalid or expired token')
+
+                # فك تشفير الـ token: user_id|expiry_timestamp
+                try:
+                    user_id, expiry = token_data.split('|')
+                    user_id = int(user_id)
+                    expiry = int(expiry)
+
+                    # تحقق من انتهاء الصلاحية
+                    current_time = int(time.time())
+                    if current_time > expiry:
+                        _logger.error("❌ Token expired")
+                        env['ir.config_parameter'].set_param(token_key, False)
+                        cr.commit()
+                        return self._error_response('Token expired. Please try again.')
+
+                except ValueError as e:
+                    _logger.error("❌ Invalid token format: %s", str(e))
+                    return self._error_response('Invalid token format')
+
+                # البحث عن المستخدم
+                user = env['res.users'].browse(user_id)
+                if not user.exists():
+                    _logger.error("❌ User not found: ID %s", user_id)
+                    return self._error_response('User not found')
+
+                if not user.active:
+                    _logger.error("❌ User inactive: %s", user.login)
+                    return self._error_response('User is inactive')
+
+                _logger.info("✅ Token validated for user: %s (ID: %s)", user.login, user.id)
+
+                # حذف الـ token بعد الاستخدام
+                env['ir.config_parameter'].set_param(token_key, False)
+                cr.commit()
+
+                # ✨ الحل النهائي: إنشاء session جديدة
+                request.session.logout(keep_db=True)
+                
+                # تسجيل الدخول باستخدام uid مباشرة
+                request.session.uid = user_id
+                request.session.login = user.login
+                request.session.db = db_name
+                
+                # الحصول على context
+                with registry.cursor() as cr2:
+                    env2 = http.Environment(cr2, user_id, {})
+                    context = env2['res.users'].context_get()
+                    request.session.context = context
+                
+                _logger.info("✅ Session created successfully for user: %s", user.login)
 
             # إعادة توجيه للصفحة الرئيسية
             return werkzeug.utils.redirect('/web')
