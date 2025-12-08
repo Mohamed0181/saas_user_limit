@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # saas_auto_login_client/controllers/main.py
 
-from odoo import http, SUPERUSER_ID
+from odoo import http
 from odoo.http import request
 import logging
 import time
@@ -55,28 +55,28 @@ class SaasAutoLoginClientController(http.Controller):
             # حذف الـ token
             request.env['ir.config_parameter'].sudo().set_param(token_key, False)
 
-            # ✨ الحل الصحيح: تحديث session بشكل كامل
-            # تنظيف الـ session القديمة
-            request.session.logout(keep_db=True)
-            
-            # تحديث الـ session بالمستخدم الجديد
+            # ✨ الحل النهائي: تحديث session مباشرة
             request.session.uid = user_id
             request.session.login = user.login
             request.session.db = request.db
+            request.session.session_token = request.session.sid
             
-            # تحديث الـ environment
-            request.update_env(user=user_id)
+            # تحديث context
+            request.session.context = {
+                'lang': user.lang,
+                'tz': user.tz,
+                'uid': user_id,
+            }
             
-            # حفظ context المستخدم
-            request.session.context = dict(request.env['res.users'].sudo().browse(user_id).context_get())
+            _logger.info("✅ Session updated - UID: %s, Login: %s", user_id, user.login)
             
-            # وضع علامة modified لحفظ التغييرات
-            request.session.modified = True
+            # Redirect مع معلومات الـ session
+            response = werkzeug.utils.redirect('/web')
             
-            _logger.info("✅ Login successful for: %s", user.login)
-
-            # Redirect
-            return werkzeug.utils.redirect('/web')
+            # إضافة session_id للـ cookie
+            response.set_cookie('session_id', request.session.sid)
+            
+            return response
 
         except Exception as e:
             _logger.error("❌ Auto-login failed: %s", str(e), exc_info=True)
