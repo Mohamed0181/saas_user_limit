@@ -43,34 +43,20 @@ class SaasClientLoginController(http.Controller):
             try:
                 _logger.info("🔑 Creating session for user: %s (ID: %s)", user.login, user.id)
                 
-                # ✅ الطريقة الصحيحة لـ Odoo 18 - بدون استخدام authenticate
-                # إنشاء الـ session مباشرة
+                # ✅ الطريقة الصحيحة لـ Odoo 18
                 request.session.uid = user.id
                 request.session.login = user.login
                 request.session.db = request.env.cr.dbname
                 
-                # تعيين الـ session token
-                if not request.session.sid:
-                    request.session.rotate = True
-                
                 # الحصول على context المستخدم
-                with request.env.cr.savepoint():
-                    user_rec = request.env['res.users'].sudo().browse(user.id)
-                    context = user_rec.context_get() or {}
-                    request.session.context = dict(context)
-                
-                # حفظ الـ session
-                request.session.save()
-                
-                # تحديث الـ environment
-                request.update_env(user=user.id)
+                user_rec = request.env['res.users'].sudo().browse(user.id)
+                context = user_rec.context_get() or {}
+                request.session.context = dict(context)
                 
                 _logger.info("✅ Session created successfully for user: %s", user.login)
                 
                 # تحديث last login
-                request.env['res.users'].sudo().browse(user.id).write({
-                    'login_date': fields.Datetime.now()
-                })
+                user_rec.write({'login_date': fields.Datetime.now()})
 
             except Exception as e:
                 _logger.error("❌ Failed to create session: %s", str(e), exc_info=True)
