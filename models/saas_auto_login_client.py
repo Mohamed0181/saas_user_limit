@@ -154,30 +154,24 @@ class SaasAutoLoginController(http.Controller):
             del TOKEN_STORAGE[token]
             _logger.info("🗑️ Token deleted after use")
             
-            # ✅✅✅ تسجيل الدخول بدون كلمة مرور
-            # الطريقة 1: استخدام session مباشرة (يعمل في معظم الإصدارات)
-            try:
-                request.session.uid = user_id
-                request.session.login = user_login
-                request.session.db = db_name
-                request.session.context = {
-                    'lang': user.lang or 'en_US',
-                    'tz': user.tz or 'UTC',
-                    'uid': user_id,
-                }
-                # تحديث الـ environment
-                request.update_env(user=user_id)
-                _logger.info("✅ Method 1: Direct session update successful")
-            except AttributeError:
-                # الطريقة 2: إذا فشلت الأولى، جرّب authenticate بدون user_id
-                try:
-                    request.session.authenticate(db_name, user_login, None)
-                    _logger.info("✅ Method 2: Authenticate without password successful")
-                except:
-                    # الطريقة 3: تسجيل دخول مؤقت ثم تبديل المستخدم
-                    request.session.uid = user_id
-                    request.env = request.env(user=user_id)
-                    _logger.info("✅ Method 3: Env update successful")
+            # ✅✅✅ تسجيل الدخول في Odoo 18
+            # يجب تعيين جميع خصائص الـ session بشكل صحيح
+            request.session.uid = user_id
+            request.session.login = user_login
+            request.session.db = db_name
+            
+            # ✅ CRITICAL: إنشاء session_token (مطلوب في Odoo 18)
+            request.session.session_token = secrets.token_hex(16)
+            
+            # ✅ تعيين الـ context
+            request.session.context = {
+                'lang': user.lang or 'en_US',
+                'tz': user.tz or 'UTC',
+                'uid': user_id,
+            }
+            
+            # ✅ تحديث الـ environment
+            request.update_env(user=user_id)
             
             _logger.info("✅✅✅ Autologin SUCCESS for user: %s (ID: %d)", user_login, user_id)
             
