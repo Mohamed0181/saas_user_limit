@@ -4,6 +4,7 @@ from odoo.http import request
 import secrets
 from datetime import datetime, timedelta
 import logging
+import werkzeug
 
 _logger = logging.getLogger(__name__)
 
@@ -16,7 +17,6 @@ class SaasAutoLoginController(http.Controller):
     def generate_auth_link(self, **kwargs):
         """توليد رابط تسجيل دخول تلقائي"""
         try:
-            # ✅ استخراج الـ parameters من kwargs
             user_id = kwargs.get('user_id')
             admin_password = kwargs.get('admin_password')
             
@@ -74,7 +74,7 @@ class SaasAutoLoginController(http.Controller):
             _logger.error("❌ Generate link failed: %s", str(e), exc_info=True)
             return {'success': False, 'error': str(e)}
 
-    @http.route('/saas/autologin', type='http', auth='none', methods=['GET'], csrf=False)
+    @http.route('/saas/autologin', type='http', auth='none', methods=['GET'], csrf=False, website=True)
     def autologin(self, token, **kwargs):
         """تسجيل الدخول التلقائي باستخدام الـ token"""
         try:
@@ -110,22 +110,28 @@ class SaasAutoLoginController(http.Controller):
             del TOKEN_STORAGE[token]
             _logger.info("🗑️ Token used and deleted")
             
-            # 🎯 تسجيل الدخول الفعلي
+            # 🎯 الحل الصحيح: تسجيل الدخول باستخدام request.session.authenticate
+            db_name = request.env.cr.dbname
+            
+            # طريقة 1: استخدام authenticate (الأفضل)
+            request.session.authenticate(db_name, user_login, user_login)
             request.session.uid = user_id
-            request.session.login = user_login
-            request.session.password = secrets.token_urlsafe(16)
-            request.session.context = {
+            
+            # تحديث الـ context
+            request.session.context = dict(request.session.context or {})
+            request.session.context.update({
                 'lang': user.lang or 'en_US',
                 'tz': user.tz or 'UTC',
                 'uid': user_id,
-            }
+            })
             
             # تحديث environment
             request.uid = user_id
             
             _logger.info("✅✅✅ Autologin SUCCESS for user: %s (ID: %d)", user_login, user_id)
             
-            return request.redirect('/web')
+            # إعادة التوجيه إلى الصفحة الرئيسية
+            return werkzeug.utils.redirect('/web', 303)
             
         except Exception as e:
             _logger.error("❌ Autologin FAILED: %s", str(e), exc_info=True)
@@ -133,7 +139,7 @@ class SaasAutoLoginController(http.Controller):
                 'error': f'فشل تسجيل الدخول التلقائي: {str(e)}'
             })
 
-    @http.route('/saas/cleanup_tokens', type='json', auth='none', methods=['POST'])
+    @http.route('/saas/cleanup_tokens', type='json', auth='user', methods=['POST'])
     def cleanup_expired_tokens(self):
         """تنظيف الـ tokens المنتهية"""
         now = datetime.now()
