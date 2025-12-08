@@ -1,56 +1,470 @@
-# ملف اسمه: /custom_addons/saas_core_login/controllers/client_login.py
 # -*- coding: utf-8 -*-
 from odoo import http
 from odoo.http import request
-import logging, time, secrets
+import logging
+from datetime import datetime
 
 _logger = logging.getLogger(__name__)
 
-class SaasCoreAutoLogin(http.Controller):
 
-    @http.route('/saas/client_login/<string:token>', type='http', auth='none', csrf=False, save_session=False)
-    def client_login(self, token, redirect='/web', **kw):
+class SaasClientLoginController(http.Controller):
+    """
+    Controller الخاص بقاعدة بيانات العميل
+    يستقبل الـ token ويقوم بتسجيل الدخول
+    """
+
+    @http.route('/saas/client_login/<string:token>', 
+                type='http', auth='public', website=False, csrf=False)
+    def client_auto_login(self, token, **kwargs):
+        """
+        استقبال الـ Token والتحقق منه وتسجيل دخول المستخدم
+        """
+        # الحصول على بيانات الـ request
+        ip_address = request.httprequest.environ.get('REMOTE_ADDR', 'unknown')
+        user_agent = request.httprequest.environ.get('HTTP_USER_AGENT', '')
+        
         try:
-            db = request.db or request.httprequest.host.split(':')[0]
-            if not db:
-                return "Database not found", 400
+            _logger.info("🔐 Client auto-login request received with token: %s...", token[:10])
+            _logger.info("🌐 IP: %s", ip_address)
 
-            token_key = f'saas_auto_login_token_{token}'
+            # ✅ استخدام Token Manager للتحقق وتسجيل الدخول
+            token_manager = request.env['saas.client.token.manager']
+            result = token_manager.validate_and_login_user(token)
+
+            # ✅ تسجيل المحاولة في Security Log (اختياري)
+            self._log_login_attempt(result, token, ip_address, user_agent)
+
+            if not result['success']:
+                return self._handle_failed_login(result)
+
+            # ✅ تسجيل الدخول للمستخدم
+            user = result['user']
             
-            with request.env.registry.cursor() as cr:
-                env = http.api.Environment(cr, http.SUPERUSER_ID, {})
-                token_data = env['ir.config_parameter'].sudo().get_param(token_key)
+            try:
+                # إنشاء session
+                request.session.authenticate(
+                    request.env.cr.dbname,
+                    user.login,
+                    user.id
+                )
                 
-                if not token_data or '|' not in token_data:
-                    return "Invalid token", 401
-                    
-                user_id, expiry = token_data.split('|', 1)
-                user_id, expiry = int(user_id), int(expiry)
+                _logger.info("✅ User logged in successfully: %s (ID: %s)", user.login, user.id)
                 
-                if time.time() > expiry:
-                    env['ir.config_parameter'].sudo().set_param(token_key, False)
-                    cr.commit()
-                    return "Token expired", 410
-                
-                user = env['res.users'].sudo().browse(user_id)
-                if not user.exists() or not user.active:
-                    return "User invalid", 403
-                
-                # الحل السحري لـ Odoo 18/19
-                request.session.logout(keep_db=True)
-                request.session.uid = user_id
-                request.session.login = user.login
-                request.session.session_token = secrets.token_urlsafe(32)
-                request.session.touch()
-                
-                # حذف التوكن بعد الاستخدام
-                env['ir.config_parameter'].sudo().set_param(token_key, False)
-                cr.commit()
-                
-                response = werkzeug.utils.redirect(redirect, 303)
-                response.set_cookie('session_id', request.session.sid, max_age=90*24*60*60, httponly=True, samesite='Lax')
-                return response
-                
+                # تحديث last login
+                user.sudo().write({'login_date': datetime.now()})
+
+            except Exception as e:
+                _logger.error("❌ Failed to create session: %s", str(e), exc_info=True)
+                return self._error_page(f'Failed to create user session: {str(e)}', 500)
+
+            # ✅ تحديد صفحة الـ redirect حسب نوع المستخدم
+            redirect_url = self._get_redirect_url(user)
+            
+            _logger.info("🔗 Redirecting to: %s", redirect_url)
+            
+            # عرض صفحة نجاح مع auto-redirect
+            return self._success_page(user, redirect_url)
+
         except Exception as e:
-            _logger.error("SaaS Core Login failed: %s", e, exc_info=True)
-            return "Login failed", 500
+            _logger.error("❌ Client auto-login failed: %s", str(e), exc_info=True)
+            return self._error_page(f'Auto-login failed: {str(e)}', 500)
+
+    def _log_login_attempt(self, result, token, ip_address, user_agent):
+        """تسجيل محاولة الدخول في Security Log"""
+        try:
+            security_log = request.env['saas.client.security.log']
+            
+            if result['success']:
+                login_type = 'auto_login_success'
+                user_id = result['user_id']
+                error_message = None
+            else:
+                reason = result['reason']
+                login_type_map = {
+                    'expired': 'token_expired',
+                    'not_found': 'token_invalid',
+                    'invalid_format': 'token_invalid',
+                    'user_not_found': 'auto_login_failed',
+                    'user_inactive': 'user_inactive',
+                }
+                login_type = login_type_map.get(reason, 'auto_login_failed')
+                user_id = result.get('user_id')
+                error_message = f"Reason: {reason}"
+
+            security_log.log_attempt(
+                user_id=user_id,
+                login_type=login_type,
+                success=result['success'],
+                ip_address=ip_address,
+                user_agent=user_agent,
+                token_hash=token[:10] + '...',
+                error_message=error_message
+            )
+        except:
+            pass  # لا نريد أن يفشل الـ login بسبب فشل الـ logging
+
+    def _handle_failed_login(self, result):
+        """معالجة فشل تسجيل الدخول"""
+        reason = result['reason']
+        
+        error_messages = {
+            'invalid_format': ('Invalid token format', 400),
+            'not_found': ('Invalid or expired token', 401),
+            'expired': ('Token has expired. Please request a new login link.', 401),
+            'user_not_found': ('User not found', 404),
+            'user_inactive': (f"User {result.get('user_name', 'Unknown')} is inactive", 403),
+            'parse_error': (f"Token data error: {result.get('error', 'Unknown')}", 400),
+        }
+        
+        message, code = error_messages.get(reason, ('Authentication failed', 401))
+        return self._error_page(message, code)
+
+    def _get_redirect_url(self, user):
+        """تحديد URL الـ redirect حسب نوع المستخدم"""
+        
+        # يمكنك تخصيص الـ redirect حسب المجموعات
+        if user.has_group('base.group_system'):
+            return '/web#action=base.action_res_users'
+        elif user.has_group('sales_team.group_sale_manager'):
+            return '/web#action=sale.action_orders'
+        elif user.has_group('sales_team.group_sale_salesman'):
+            return '/web#action=sale.action_quotations'
+        elif user.has_group('account.group_account_manager'):
+            return '/web#action=account.action_move_out_invoice_type'
+        elif user.has_group('purchase.group_purchase_user'):
+            return '/web#action=purchase.purchase_rfq'
+        
+        # Default redirect
+        return '/web'
+
+    def _success_page(self, user, redirect_url):
+        """عرض صفحة نجاح تسجيل الدخول مع auto-redirect"""
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <title>Login Successful</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <meta http-equiv="refresh" content="2;url={redirect_url}">
+            <style>
+                * {{
+                    margin: 0;
+                    padding: 0;
+                    box-sizing: border-box;
+                }}
+                body {{
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 20px;
+                }}
+                .success-container {{
+                    background: white;
+                    padding: 50px 40px;
+                    border-radius: 15px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                    max-width: 500px;
+                    width: 100%;
+                    text-align: center;
+                    animation: slideIn 0.4s ease-out;
+                }}
+                @keyframes slideIn {{
+                    from {{
+                        opacity: 0;
+                        transform: translateY(-30px) scale(0.95);
+                    }}
+                    to {{
+                        opacity: 1;
+                        transform: translateY(0) scale(1);
+                    }}
+                }}
+                .success-icon {{
+                    font-size: 70px;
+                    margin-bottom: 25px;
+                    animation: bounce 0.6s ease-in-out;
+                }}
+                @keyframes bounce {{
+                    0%, 100% {{ transform: translateY(0); }}
+                    50% {{ transform: translateY(-15px); }}
+                }}
+                h1 {{
+                    color: #4caf50;
+                    margin-bottom: 15px;
+                    font-size: 28px;
+                    font-weight: 600;
+                }}
+                .welcome-message {{
+                    color: #666;
+                    margin-bottom: 10px;
+                    font-size: 18px;
+                }}
+                .user-name {{
+                    color: #333;
+                    font-weight: 600;
+                    font-size: 20px;
+                    margin-bottom: 20px;
+                }}
+                .loader {{
+                    margin: 25px auto;
+                    border: 4px solid #f3f3f3;
+                    border-top: 4px solid #667eea;
+                    border-radius: 50%;
+                    width: 40px;
+                    height: 40px;
+                    animation: spin 1s linear infinite;
+                }}
+                @keyframes spin {{
+                    0% {{ transform: rotate(0deg); }}
+                    100% {{ transform: rotate(360deg); }}
+                }}
+                .redirect-message {{
+                    color: #888;
+                    font-size: 14px;
+                    margin-top: 20px;
+                    padding: 15px;
+                    background: #f5f5f5;
+                    border-radius: 8px;
+                    border-left: 4px solid #4caf50;
+                }}
+                .manual-link {{
+                    display: inline-block;
+                    margin-top: 20px;
+                    padding: 12px 30px;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    text-decoration: none;
+                    border-radius: 25px;
+                    font-weight: 500;
+                    transition: all 0.3s;
+                }}
+                .manual-link:hover {{
+                    transform: translateY(-2px);
+                    box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="success-container">
+                <div class="success-icon">✅</div>
+                <h1>Login Successful!</h1>
+                <div class="welcome-message">Welcome back,</div>
+                <div class="user-name">{user.name}</div>
+                <div class="loader"></div>
+                <div class="redirect-message">
+                    Redirecting you to the dashboard...<br>
+                    Please wait a moment.
+                </div>
+                <a href="{redirect_url}" class="manual-link">
+                    Click here if not redirected
+                </a>
+            </div>
+        </body>
+        </html>
+        """
+        return request.make_response(
+            html_content,
+            headers=[
+                ('Content-Type', 'text/html; charset=utf-8'),
+                ('Cache-Control', 'no-cache, no-store, must-revalidate')
+            ]
+        )
+
+    def _error_page(self, message, code):
+        """عرض صفحة خطأ"""
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <title>Login Failed</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                * {{
+                    margin: 0;
+                    padding: 0;
+                    box-sizing: border-box;
+                }}
+                body {{
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    background: linear-gradient(135deg, #f85032 0%, #e73827 100%);
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 20px;
+                }}
+                .error-container {{
+                    background: white;
+                    padding: 40px;
+                    border-radius: 15px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                    max-width: 500px;
+                    width: 100%;
+                    text-align: center;
+                    animation: slideIn 0.3s ease-out;
+                }}
+                @keyframes slideIn {{
+                    from {{
+                        opacity: 0;
+                        transform: translateY(-20px);
+                    }}
+                    to {{
+                        opacity: 1;
+                        transform: translateY(0);
+                    }}
+                }}
+                .error-icon {{
+                    font-size: 60px;
+                    margin-bottom: 20px;
+                    animation: shake 0.5s ease-in-out;
+                }}
+                @keyframes shake {{
+                    0%, 100% {{ transform: translateX(0); }}
+                    25% {{ transform: translateX(-10px); }}
+                    75% {{ transform: translateX(10px); }}
+                }}
+                h1 {{
+                    color: #d32f2f;
+                    margin-bottom: 10px;
+                    font-size: 24px;
+                }}
+                .error-code {{
+                    color: #666;
+                    font-size: 14px;
+                    margin-bottom: 20px;
+                    font-family: 'Courier New', monospace;
+                }}
+                .error-message {{
+                    color: #555;
+                    margin-bottom: 30px;
+                    line-height: 1.6;
+                    padding: 15px;
+                    background: #f5f5f5;
+                    border-radius: 8px;
+                    border-left: 4px solid #d32f2f;
+                    text-align: left;
+                }}
+                .help-text {{
+                    color: #888;
+                    font-size: 13px;
+                    margin-top: 20px;
+                    padding: 10px;
+                    background: #f9f9f9;
+                    border-radius: 6px;
+                }}
+                .btn {{
+                    display: inline-block;
+                    padding: 12px 30px;
+                    margin: 10px 5px;
+                    text-decoration: none;
+                    border-radius: 25px;
+                    font-weight: 500;
+                    transition: all 0.3s;
+                }}
+                .btn-primary {{
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                }}
+                .btn-primary:hover {{
+                    transform: translateY(-2px);
+                    box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+                }}
+                .timestamp {{
+                    margin-top: 20px;
+                    font-size: 12px;
+                    color: #999;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="error-container">
+                <div class="error-icon">❌</div>
+                <h1>Login Failed</h1>
+                <div class="error-code">Error Code: {code}</div>
+                <div class="error-message">{message}</div>
+                <div class="help-text">
+                    💡 <strong>Need help?</strong><br>
+                    Please request a new login link from your administrator.
+                </div>
+                <a href="/web/login" class="btn btn-primary">Go to Login Page</a>
+                <div class="timestamp">Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+            </div>
+        </body>
+        </html>
+        """
+        return request.make_response(
+            html_content,
+            headers=[
+                ('Content-Type', 'text/html; charset=utf-8'),
+                ('Cache-Control', 'no-cache, no-store, must-revalidate')
+            ],
+            status=code
+        )
+
+
+class SaasClientManagementController(http.Controller):
+    """
+    Controllers إضافية لإدارة العميل
+    """
+
+    @http.route('/saas/cleanup_tokens', type='json', auth='user', methods=['POST'])
+    def cleanup_expired_tokens(self, **kwargs):
+        """تنظيف يدوي للـ tokens المنتهية"""
+        try:
+            if not request.env.user.has_group('base.group_system'):
+                return {'success': False, 'error': 'Unauthorized'}
+
+            token_manager = request.env['saas.client.token.manager']
+            result = token_manager.cleanup_expired_tokens()
+            
+            return {
+                'success': True,
+                'result': result
+            }
+            
+        except Exception as e:
+            _logger.error("❌ Cleanup failed: %s", str(e), exc_info=True)
+            return {'success': False, 'error': str(e)}
+
+    @http.route('/saas/token_stats', type='json', auth='user', methods=['POST'])
+    def get_token_stats(self, **kwargs):
+        """الحصول على إحصائيات الـ Tokens"""
+        try:
+            if not request.env.user.has_group('base.group_system'):
+                return {'success': False, 'error': 'Unauthorized'}
+
+            token_manager = request.env['saas.client.token.manager']
+            stats = token_manager.get_token_stats()
+            
+            return {
+                'success': True,
+                'stats': stats
+            }
+            
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    @http.route('/saas/health', type='http', auth='public', website=False, csrf=False)
+    def health_check(self, **kwargs):
+        """Health check endpoint"""
+        try:
+            # فحص الاتصال بقاعدة البيانات
+            request.env.cr.execute("SELECT 1")
+            
+            return request.make_response(
+                '{"status": "healthy", "database": "%s", "timestamp": "%s"}' % (
+                    request.env.cr.dbname,
+                    datetime.now().isoformat()
+                ),
+                headers=[('Content-Type', 'application/json')]
+            )
+        except Exception as e:
+            return request.make_response(
+                '{"status": "unhealthy", "error": "%s"}' % str(e),
+                headers=[('Content-Type', 'application/json')],
+                status=500
+            )
