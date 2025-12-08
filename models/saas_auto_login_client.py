@@ -41,41 +41,36 @@ class SaasClientLoginController(http.Controller):
             user = result['user']
             
             try:
-                # ✅ الحصول على database name
-                db_name = request.env.cr.dbname
+                _logger.info("🔑 Creating session for user: %s (ID: %s)", user.login, user.id)
                 
-                _logger.info("🔑 Attempting to authenticate user: %s (ID: %s) in DB: %s", 
-                            user.login, user.id, db_name)
-                
-                # ✅ الطريقة الصحيحة لـ Odoo 18 - إنشاء session جديد
-                request.session.authenticate(db_name, user.login, user.id)
-                
-                # ✅ حفظ الـ session بشكل صريح
-                request.session.save()
-                
-                _logger.info("✅ Session created successfully for user: %s", user.login)
-                
-                # تحديث last login
-                user.sudo().write({'login_date': fields.Datetime.now()})
-
-            except AttributeError:
-                # ✅ Fallback للطريقة اليدوية إذا فشلت authenticate
-                _logger.warning("⚠️ Using fallback session creation method")
-                
-                # طريقة يدوية لإنشاء الـ session
+                # ✅ الطريقة الصحيحة لـ Odoo 18 - بدون استخدام authenticate
+                # إنشاء الـ session مباشرة
                 request.session.uid = user.id
                 request.session.login = user.login
-                request.session.session_token = request.session.sid
                 request.session.db = request.env.cr.dbname
                 
-                # تحديث الـ context
-                user_context = request.env['res.users'].sudo().browse(user.id).context_get()
-                request.session.context = dict(user_context) if user_context else {}
+                # تعيين الـ session token
+                if not request.session.sid:
+                    request.session.rotate = True
+                
+                # الحصول على context المستخدم
+                with request.env.cr.savepoint():
+                    user_rec = request.env['res.users'].sudo().browse(user.id)
+                    context = user_rec.context_get() or {}
+                    request.session.context = dict(context)
                 
                 # حفظ الـ session
                 request.session.save()
                 
-                _logger.info("✅ Fallback session created for user: %s", user.login)
+                # تحديث الـ environment
+                request.update_env(user=user.id)
+                
+                _logger.info("✅ Session created successfully for user: %s", user.login)
+                
+                # تحديث last login
+                request.env['res.users'].sudo().browse(user.id).write({
+                    'login_date': fields.Datetime.now()
+                })
 
             except Exception as e:
                 _logger.error("❌ Failed to create session: %s", str(e), exc_info=True)
@@ -148,7 +143,7 @@ class SaasClientLoginController(http.Controller):
         
         # يمكنك تخصيص الـ redirect حسب المجموعات
         if user.has_group('base.group_system'):
-            return '/web#action=base.action_res_users'
+            return '/web'
         elif user.has_group('sales_team.group_sale_manager'):
             return '/web#action=sale.action_orders'
         elif user.has_group('sales_team.group_sale_salesman'):
@@ -163,6 +158,12 @@ class SaasClientLoginController(http.Controller):
 
     def _success_page(self, user, redirect_url):
         """عرض صفحة نجاح تسجيل الدخول مع auto-redirect"""
+        
+        # إضافة session_id للـ redirect URL
+        session_id = request.session.sid
+        separator = '&' if '#' in redirect_url or '?' in redirect_url else '?'
+        full_redirect_url = f"{redirect_url}{separator}session_id={session_id}"
+        
         html_content = f"""
         <!DOCTYPE html>
         <html>
@@ -170,7 +171,7 @@ class SaasClientLoginController(http.Controller):
             <meta charset="utf-8">
             <title>Login Successful</title>
             <meta name="viewport" content="width=device-width, initial-scale=1">
-            <meta http-equiv="refresh" content="2;url={redirect_url}">
+            <meta http-equiv="refresh" content="1;url={full_redirect_url}">
             <style>
                 * {{
                     margin: 0;
@@ -282,7 +283,7 @@ class SaasClientLoginController(http.Controller):
                     Redirecting you to the dashboard...<br>
                     Please wait a moment.
                 </div>
-                <a href="{redirect_url}" class="manual-link">
+                <a href="{full_redirect_url}" class="manual-link">
                     Click here if not redirected
                 </a>
             </div>
@@ -294,7 +295,7 @@ class SaasClientLoginController(http.Controller):
             headers=[
                 ('Content-Type', 'text/html; charset=utf-8'),
                 ('Cache-Control', 'no-cache, no-store, must-revalidate'),
-                ('Set-Cookie', f'session_id={request.session.sid}; Path=/; HttpOnly; SameSite=Lax')
+                ('Set-Cookie', f'session_id={session_id}; Path=/; HttpOnly; SameSite=Lax')
             ]
         )
 
