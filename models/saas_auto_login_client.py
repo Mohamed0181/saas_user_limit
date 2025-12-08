@@ -33,28 +33,37 @@ class SaasAutoLoginClientController(http.Controller):
                 _logger.error("❌ Registry load failed: %s", str(e))
                 return self._error_response(f"Database error: {str(e)}", show_login=True)
 
-            # Read token from DB
+            # --- We'll collect all session data inside the cursor, then use plain values after ---
+            session_data = None
             with registry.cursor() as cr:
                 env = odoo.api.Environment(cr, odoo.SUPERUSER_ID, {})
 
                 token_key = f"saas_auto_login_token_{token}"
-                token_data = env["ir.config_parameter"].sudo().get_param(token_key)
+                try:
+                    token_data = env["ir.config_parameter"].sudo().get_param(token_key)
+                except Exception as e:
+                    _logger.error("❌ Failed to read token param: %s", str(e))
+                    return self._error_response("Failed to validate token", show_login=True)
 
                 if not token_data:
                     return self._error_response("Invalid or expired token", show_login=True)
 
                 # Decode token: "user_id|expiry"
                 try:
-                    user_id, expiry = token_data.split('|')
-                    user_id = int(user_id)
-                    expiry = int(expiry)
-                except:
+                    user_id_str, expiry_str = token_data.split('|')
+                    user_id = int(user_id_str)
+                    expiry = int(expiry_str)
+                except Exception as e:
+                    _logger.exception("❌ Invalid token format")
+                    # remove token to be safe
                     env["ir.config_parameter"].sudo().set_param(token_key, False)
+                    cr.commit()
                     return self._error_response("Invalid token format", show_login=True)
 
                 # Expired?
-                if time.time() > expiry:
+                if int(time.time()) > expiry:
                     env["ir.config_parameter"].sudo().set_param(token_key, False)
+                    cr.commit()
                     return self._error_response("Token expired, please regenerate", show_login=True)
 
                 user = env["res.users"].sudo().browse(user_id)
@@ -64,12 +73,56 @@ class SaasAutoLoginClientController(http.Controller):
                 if not user.active:
                     return self._error_response("Inactive user", show_login=True)
 
-                # Remove token (one-time use)
-                env["ir.config_parameter"].sudo().set_param(token_key, False)
-                cr.commit()
+                # Read required simple values now (while cursor is open)
+                try:
+                    user_login = user.login
+                except Exception:
+                    # ensure we always read login while cursor is alive
+                    user_login = env['res.users'].sudo().browse(user_id).login
 
-            # Create session safely
-            self._create_user_session(env, user)
+                try:
+                    # get user context in a safe way while cursor is open
+                    user_context = dict(user.context_get() or {})
+                except Exception as e:
+                    _logger.warning("⚠️ Failed to fetch user context: %s", str(e))
+                    user_context = {"lang": "en_US", "tz": "UTC", "uid": user_id}
+
+                # Remove token (one-time use)
+                try:
+                    env["ir.config_parameter"].sudo().set_param(token_key, False)
+                    cr.commit()
+                except Exception as e:
+                    _logger.warning("⚠️ Failed to delete token: %s", str(e))
+
+                # prepare session data (plain Python types)
+                session_data = {
+                    "db": db_name,
+                    "uid": user_id,
+                    "login": user_login,
+                    "context": user_context,
+                    "create_time": int(time.time()),
+                }
+
+            # --- Outside cursor: only use plain values, never touch ORM recordsets ---
+            if not session_data:
+                return self._error_response("Failed to prepare session data", show_login=True)
+
+            # Create session safely (no ORM access here)
+            try:
+                # clear previous session and set values
+                request.session.clear()
+                request.session.db = session_data["db"]
+                request.session.uid = session_data["uid"]
+                request.session.login = session_data["login"]
+                # set context as a dict
+                request.session.context = session_data["context"]
+                # set create_time to satisfy Odoo session save check
+                request.session["create_time"] = session_data["create_time"]
+            except Exception as e:
+                _logger.exception("❌ Failed to set request.session: %s", str(e))
+                return self._error_response("Failed to create session", show_login=True)
+
+            _logger.info("✅ Session created successfully for user: %s", session_data["login"])
 
             return werkzeug.utils.redirect("/web")
 
@@ -96,31 +149,6 @@ class SaasAutoLoginClientController(http.Controller):
             request.session.db = db
 
         return db
-
-    # ----------------------------------------------------------------------
-    # Create Session (Odoo 17 & 18 Safe)
-    # ----------------------------------------------------------------------
-    def _create_user_session(self, env, user):
-        """Create session without cursor issues (Odoo 18 compatible)."""
-
-        request.session.clear()
-
-        request.session.db = env.cr.dbname
-        request.session.uid = user.id
-        request.session.login = user.login
-
-        try:
-            ctx = user.context_get()
-            request.session.context = ctx
-        except Exception as e:
-            _logger.warning("⚠️ Failed to load context: %s", str(e))
-            request.session.context = {
-                "lang": "en_US",
-                "tz": "UTC",
-                "uid": user.id,
-            }
-
-        _logger.info("✅ Session created successfully for user: %s", user.login)
 
     # ----------------------------------------------------------------------
     # Error Page
