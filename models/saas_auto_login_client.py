@@ -1,175 +1,178 @@
 # -*- coding: utf-8 -*-
-# saas_auto_login_client/controllers/main.py
-
 from odoo import http
 from odoo.http import request
 import logging
 import time
-import werkzeug
 
 _logger = logging.getLogger(__name__)
 
 
-class SaasAutoLoginClientController(http.Controller):
+class SaasClientLoginController(http.Controller):
+    """
+    Controller يعمل في قاعدة بيانات العميل
+    يستقبل الـ token ويسجل دخول المستخدم
+    """
 
-    @http.route('/saas/client_login/<string:token>',
-                type='http', auth='none', csrf=False, website=False)
+    @http.route('/saas/client_login/<string:token>', 
+                type='http', auth='public', website=False, csrf=False)
     def client_auto_login(self, token, **kwargs):
-        """Auto login controller (Odoo 18 Compatible)"""
+        """
+        تسجيل دخول تلقائي باستخدام الـ token
+        """
         try:
-            _logger.info("🔐 Auto-login request token=%s", token[:10])
+            _logger.info("🔐 Client auto-login request received with token: %s...", token[:10])
 
-            db_name = self._ensure_db()
-            if not db_name:
-                return self._error_response("Database not found", show_login=True)
+            # قراءة الـ token من ir.config_parameter
+            token_key = f'saas_auto_login_token_{token}'
+            IrConfigParameter = request.env['ir.config_parameter'].sudo()
+            
+            token_data = IrConfigParameter.get_param(token_key)
 
-            _logger.info("📊 Using DB: %s", db_name)
+            if not token_data:
+                _logger.error("❌ Token not found or expired: %s", token[:10])
+                return self._error_page('Invalid or expired login token', 401)
 
-            # Registry loader for Odoo 18
-            import odoo
+            # فك تشفير البيانات
             try:
-                registry = odoo.modules.registry.Registry(db_name)
-            except Exception as e:
-                _logger.error("❌ Registry load failed: %s", str(e))
-                return self._error_response(f"Database error: {str(e)}", show_login=True)
+                user_id, expiry = token_data.split('|')
+                user_id = int(user_id)
+                expiry = int(expiry)
+            except ValueError:
+                _logger.error("❌ Invalid token format")
+                return self._error_page('Invalid token format', 400)
 
-            # --- We'll collect all session data inside the cursor, then use plain values after ---
-            session_data = None
-            with registry.cursor() as cr:
-                env = odoo.api.Environment(cr, odoo.SUPERUSER_ID, {})
+            # التحقق من انتهاء الصلاحية
+            current_time = int(time.time())
+            if current_time > expiry:
+                _logger.error("❌ Token expired: %s", token[:10])
+                # حذف الـ token المنتهي
+                IrConfigParameter.set_param(token_key, False)
+                return self._error_page('Login token has expired. Please try again.', 401)
 
-                token_key = f"saas_auto_login_token_{token}"
-                try:
-                    token_data = env["ir.config_parameter"].sudo().get_param(token_key)
-                except Exception as e:
-                    _logger.error("❌ Failed to read token param: %s", str(e))
-                    return self._error_response("Failed to validate token", show_login=True)
+            # جلب المستخدم
+            user = request.env['res.users'].sudo().browse(user_id)
 
-                if not token_data:
-                    return self._error_response("Invalid or expired token", show_login=True)
+            if not user.exists():
+                _logger.error("❌ User not found: ID %s", user_id)
+                return self._error_page('User not found', 404)
 
-                # Decode token: "user_id|expiry"
-                try:
-                    user_id_str, expiry_str = token_data.split('|')
-                    user_id = int(user_id_str)
-                    expiry = int(expiry_str)
-                except Exception as e:
-                    _logger.exception("❌ Invalid token format")
-                    # remove token to be safe
-                    env["ir.config_parameter"].sudo().set_param(token_key, False)
-                    cr.commit()
-                    return self._error_response("Invalid token format", show_login=True)
+            if not user.active:
+                _logger.error("❌ User is inactive: %s (ID: %s)", user.name, user.id)
+                return self._error_page(f'User {user.name} is inactive', 403)
 
-                # Expired?
-                if int(time.time()) > expiry:
-                    env["ir.config_parameter"].sudo().set_param(token_key, False)
-                    cr.commit()
-                    return self._error_response("Token expired, please regenerate", show_login=True)
+            _logger.info("✅ User found: %s (ID: %s, Login: %s)", user.name, user.id, user.login)
 
-                user = env["res.users"].sudo().browse(user_id)
-                if not user.exists():
-                    return self._error_response("User not found", show_login=True)
+            # حذف الـ token بعد الاستخدام (one-time use)
+            IrConfigParameter.set_param(token_key, False)
+            _logger.info("🗑️ Token deleted after use")
 
-                if not user.active:
-                    return self._error_response("Inactive user", show_login=True)
+            # تسجيل الدخول
+            request.session.authenticate(
+                request.env.cr.dbname,
+                user.login,
+                user.id,  # استخدام user.id بدلاً من password
+            )
 
-                # Read required simple values now (while cursor is open)
-                try:
-                    user_login = user.login
-                except Exception:
-                    # ensure we always read login while cursor is alive
-                    user_login = env['res.users'].sudo().browse(user_id).login
+            _logger.info("✅ User logged in successfully: %s", user.login)
 
-                try:
-                    # get user context in a safe way while cursor is open
-                    user_context = dict(user.context_get() or {})
-                except Exception as e:
-                    _logger.warning("⚠️ Failed to fetch user context: %s", str(e))
-                    user_context = {"lang": "en_US", "tz": "UTC", "uid": user_id}
-
-                # Remove token (one-time use)
-                try:
-                    env["ir.config_parameter"].sudo().set_param(token_key, False)
-                    cr.commit()
-                except Exception as e:
-                    _logger.warning("⚠️ Failed to delete token: %s", str(e))
-
-                # prepare session data (plain Python types)
-                session_data = {
-                    "db": db_name,
-                    "uid": user_id,
-                    "login": user_login,
-                    "context": user_context,
-                    "create_time": int(time.time()),
-                }
-
-            # --- Outside cursor: only use plain values, never touch ORM recordsets ---
-            if not session_data:
-                return self._error_response("Failed to prepare session data", show_login=True)
-
-            # Create session safely (no ORM access here)
-            try:
-                # clear previous session and set values
-                request.session.clear()
-                request.session.db = session_data["db"]
-                request.session.uid = session_data["uid"]
-                request.session.login = session_data["login"]
-                # set context as a dict
-                request.session.context = session_data["context"]
-                # set create_time to satisfy Odoo session save check
-                request.session["create_time"] = session_data["create_time"]
-            except Exception as e:
-                _logger.exception("❌ Failed to set request.session: %s", str(e))
-                return self._error_response("Failed to create session", show_login=True)
-
-            _logger.info("✅ Session created successfully for user: %s", session_data["login"])
-
-            return werkzeug.utils.redirect("/web")
+            # إعادة التوجيه للـ dashboard
+            return http.redirect_with_hash('/web')
 
         except Exception as e:
-            _logger.error("❌ Auto-login failure: %s", str(e), exc_info=True)
-            return self._error_response(str(e), show_login=True)
+            _logger.error("❌ Client auto-login failed: %s", str(e), exc_info=True)
+            return self._error_page(f'Login failed: {str(e)}', 500)
 
-    # ----------------------------------------------------------------------
-    # Detect DB
-    # ----------------------------------------------------------------------
-    def _ensure_db(self):
-        db = request.session.db if hasattr(request, "session") else None
-
-        if not db and hasattr(request, "db"):
-            db = request.db
-
-        if not db:
-            import odoo
-            dbs = odoo.service.db.list_dbs(True)
-            if dbs:
-                db = dbs[0]
-
-        if db and hasattr(request, "session"):
-            request.session.db = db
-
-        return db
-
-    # ----------------------------------------------------------------------
-    # Error Page
-    # ----------------------------------------------------------------------
-    def _error_response(self, message, show_login=False):
-        login_button = (
-            '<a href="/web/login" class="btn btn-primary">Go to Login Page</a>'
-            if show_login else ""
-        )
-
-        html = f"""
+    def _error_page(self, message, code):
+        """عرض صفحة خطأ"""
+        html_content = f"""
+        <!DOCTYPE html>
         <html>
-        <head><meta charset="utf-8"><title>Auto Login Error</title></head>
-        <body style="background:#f8f8f8;font-family:Arial;padding:50px;text-align:center;">
-            <h1 style="color:#c00;">❌ Auto Login Failed</h1>
-            <p style="background:#fff;padding:20px;border-radius:10px;display:inline-block;">
-                {message}
-            </p><br><br>
-            {login_button}
-            <a href="javascript:window.close();" class="btn btn-secondary">Close</a>
+        <head>
+            <meta charset="utf-8">
+            <title>Login Error</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                * {{
+                    margin: 0;
+                    padding: 0;
+                    box-sizing: border-box;
+                }}
+                body {{
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 20px;
+                }}
+                .error-container {{
+                    background: white;
+                    padding: 40px;
+                    border-radius: 15px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                    max-width: 500px;
+                    width: 100%;
+                    text-align: center;
+                }}
+                .error-icon {{
+                    font-size: 60px;
+                    margin-bottom: 20px;
+                    animation: shake 0.5s ease-in-out;
+                }}
+                @keyframes shake {{
+                    0%, 100% {{ transform: translateX(0); }}
+                    25% {{ transform: translateX(-10px); }}
+                    75% {{ transform: translateX(10px); }}
+                }}
+                h1 {{
+                    color: #d32f2f;
+                    margin-bottom: 10px;
+                    font-size: 24px;
+                }}
+                .error-code {{
+                    color: #666;
+                    font-size: 14px;
+                    margin-bottom: 20px;
+                }}
+                .error-message {{
+                    color: #555;
+                    margin-bottom: 30px;
+                    line-height: 1.6;
+                    padding: 15px;
+                    background: #f5f5f5;
+                    border-radius: 8px;
+                    border-left: 4px solid #d32f2f;
+                    text-align: left;
+                }}
+                .btn {{
+                    padding: 12px 30px;
+                    text-decoration: none;
+                    border-radius: 25px;
+                    display: inline-block;
+                    font-weight: 500;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    transition: all 0.3s;
+                }}
+                .btn:hover {{
+                    transform: translateY(-2px);
+                    box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="error-container">
+                <div class="error-icon">🔒</div>
+                <h1>Login Failed</h1>
+                <div class="error-code">Error Code: {code}</div>
+                <div class="error-message">{message}</div>
+                <a href="javascript:window.close();" class="btn">Close Window</a>
+            </div>
         </body>
         </html>
         """
-        return request.make_response(html, headers=[("Content-Type", "text/html")])
+        return request.make_response(
+            html_content, 
+            headers=[('Content-Type', 'text/html; charset=utf-8')]
+        )
