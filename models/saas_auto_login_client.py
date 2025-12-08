@@ -7,31 +7,43 @@ import logging
 
 _logger = logging.getLogger(__name__)
 
-# تخزين مؤقت للـ tokens (أفضل من ir.config_parameter)
 TOKEN_STORAGE = {}
 
 
 class SaasAutoLoginController(http.Controller):
     
     @http.route('/saas/generate_auth_link', type='json', auth='none', methods=['POST'], csrf=False)
-    def generate_auth_link(self, user_id, admin_password, **kwargs):
+    def generate_auth_link(self, **kwargs):
         """توليد رابط تسجيل دخول تلقائي"""
         try:
+            # ✅ استخراج الـ parameters من kwargs
+            user_id = kwargs.get('user_id')
+            admin_password = kwargs.get('admin_password')
+            
+            _logger.info("🔍 Request received - user_id: %s", user_id)
+            
+            if not user_id or not admin_password:
+                return {'success': False, 'error': 'Missing user_id or admin_password'}
+            
+            user_id = int(user_id)
+            
             # تحقق من كلمة سر الأدمن
             admin = request.env['res.users'].sudo().search([('login', '=', 'admin')], limit=1)
             if not admin:
-                _logger.error("Admin user not found")
+                _logger.error("❌ Admin user not found")
                 return {'success': False, 'error': 'Admin not found'}
             
             try:
                 admin.sudo()._check_credentials(admin_password, {'interactive': False})
+                _logger.info("✅ Admin password verified")
             except Exception as e:
-                _logger.error("Wrong admin password: %s", str(e))
+                _logger.error("❌ Wrong admin password: %s", str(e))
                 return {'success': False, 'error': 'Wrong admin password'}
             
             # التحقق من المستخدم
             user = request.env['res.users'].sudo().browse(user_id)
             if not user.exists():
+                _logger.error("❌ User not found: %d", user_id)
                 return {'success': False, 'error': 'User not found'}
             
             # توليد token آمن
@@ -41,6 +53,7 @@ class SaasAutoLoginController(http.Controller):
             # حفظ في الذاكرة المؤقتة
             TOKEN_STORAGE[token] = {
                 'user_id': user_id,
+                'user_login': user.login,
                 'expires': expires,
                 'db_name': request.env.cr.dbname
             }
@@ -67,7 +80,6 @@ class SaasAutoLoginController(http.Controller):
         try:
             _logger.info("🔑 Autologin attempt with token: %s...", token[:10])
             
-            # جلب بيانات الـ token
             data = TOKEN_STORAGE.get(token)
             
             if not data:
@@ -76,7 +88,6 @@ class SaasAutoLoginController(http.Controller):
                     'error': 'رمز التسجيل غير صالح أو تم استخدامه مسبقاً'
                 })
             
-            # التحقق من صلاحية الـ token
             if datetime.now() > data['expires']:
                 del TOKEN_STORAGE[token]
                 _logger.warning("⚠️ Token expired")
@@ -85,8 +96,8 @@ class SaasAutoLoginController(http.Controller):
                 })
             
             user_id = data['user_id']
+            user_login = data['user_login']
             
-            # التحقق من المستخدم
             user = request.env['res.users'].sudo().browse(user_id)
             if not user.exists() or not user.active:
                 del TOKEN_STORAGE[token]
@@ -97,23 +108,23 @@ class SaasAutoLoginController(http.Controller):
             
             # حذف الـ token (استخدام لمرة واحدة فقط)
             del TOKEN_STORAGE[token]
+            _logger.info("🗑️ Token used and deleted")
             
-            # 🎯 السطور الذهبية - تسجيل الدخول الفعلي
-            request.session.authenticate(
-                request.env.cr.dbname,
-                user.login,
-                user.partner_id.signup_token or secrets.token_urlsafe(16)
-            )
-            
-            # أو الطريقة البديلة (أكثر أماناً):
+            # 🎯 تسجيل الدخول الفعلي
             request.session.uid = user_id
-            request.session.login = user.login
-            request.session.session_token = user.partner_id.signup_token or secrets.token_urlsafe(40)
-            request.session.context = request.env['ir.http']._authenticate(user.login, request.session.session_token)
+            request.session.login = user_login
+            request.session.password = secrets.token_urlsafe(16)
+            request.session.context = {
+                'lang': user.lang or 'en_US',
+                'tz': user.tz or 'UTC',
+                'uid': user_id,
+            }
             
-            _logger.info("✅ Autologin SUCCESS for user: %s (ID: %d)", user.login, user_id)
+            # تحديث environment
+            request.uid = user_id
             
-            # إعادة التوجيه للداشبورد
+            _logger.info("✅✅✅ Autologin SUCCESS for user: %s (ID: %d)", user_login, user_id)
+            
             return request.redirect('/web')
             
         except Exception as e:
@@ -122,12 +133,12 @@ class SaasAutoLoginController(http.Controller):
                 'error': f'فشل تسجيل الدخول التلقائي: {str(e)}'
             })
 
-    @http.route('/saas/cleanup_tokens', type='json', auth='user', methods=['POST'])
+    @http.route('/saas/cleanup_tokens', type='json', auth='none', methods=['POST'])
     def cleanup_expired_tokens(self):
-        """تنظيف الـ tokens المنتهية (يمكن استدعاؤه من cron)"""
+        """تنظيف الـ tokens المنتهية"""
         now = datetime.now()
         expired = [k for k, v in TOKEN_STORAGE.items() if v['expires'] < now]
         for token in expired:
             del TOKEN_STORAGE[token]
         _logger.info("🧹 Cleaned %d expired tokens", len(expired))
-        return {'cleaned': len(expired)}
+        return {'cleaned': len(expired), 'remaining': len(TOKEN_STORAGE)}
