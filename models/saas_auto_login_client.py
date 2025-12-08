@@ -55,14 +55,23 @@ class SaasAutoLoginClientController(http.Controller):
             # حذف الـ token
             request.env['ir.config_parameter'].sudo().set_param(token_key, False)
 
-            # ✨ الحل الصحيح: استخدام update_env
-            request.update_env(user=user_id)
+            # ✨ الحل الصحيح: تحديث session بشكل كامل
+            # تنظيف الـ session القديمة
+            request.session.logout(keep_db=True)
             
-            # تحديث الـ session
+            # تحديث الـ session بالمستخدم الجديد
             request.session.uid = user_id
             request.session.login = user.login
-            request.session.session_token = request.session.sid
-            request.session.context = request.env.context
+            request.session.db = request.db
+            
+            # تحديث الـ environment
+            request.update_env(user=user_id)
+            
+            # حفظ context المستخدم
+            request.session.context = dict(request.env['res.users'].sudo().browse(user_id).context_get())
+            
+            # حفظ الـ session
+            request.session.save()
             
             _logger.info("✅ Login successful for: %s", user.login)
 
