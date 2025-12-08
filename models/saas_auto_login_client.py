@@ -5,6 +5,7 @@ import secrets
 from datetime import datetime, timedelta
 import logging
 import werkzeug
+import json
 
 _logger = logging.getLogger(__name__)
 
@@ -13,17 +14,34 @@ TOKEN_STORAGE = {}
 
 class SaasAutoLoginController(http.Controller):
     
-    @http.route('/saas/generate_auth_link', type='json', auth='none', methods=['POST'], csrf=False)
+    @http.route('/saas/generate_auth_link', type='http', auth='none', methods=['POST'], csrf=False)
     def generate_auth_link(self, **kwargs):
-        """توليد رابط تسجيل دخول تلقائي"""
+        """توليد رابط تسجيل دخول تلقائي - يقبل JSON عادي"""
         try:
-            user_id = kwargs.get('user_id')
-            admin_password = kwargs.get('admin_password')
+            # ✅ قراءة البيانات من request.httprequest.data
+            if request.httprequest.data:
+                data = json.loads(request.httprequest.data.decode('utf-8'))
+                
+                # إذا كان JSONRPC format
+                if 'params' in data:
+                    params = data['params']
+                else:
+                    params = data
+                    
+                user_id = params.get('user_id')
+                admin_password = params.get('admin_password')
+            else:
+                # قراءة من kwargs
+                user_id = kwargs.get('user_id')
+                admin_password = kwargs.get('admin_password')
             
             _logger.info("🔍 Request received - user_id: %s", user_id)
             
             if not user_id or not admin_password:
-                return {'success': False, 'error': 'Missing user_id or admin_password'}
+                return request.make_json_response({
+                    'success': False, 
+                    'error': 'Missing user_id or admin_password'
+                })
             
             user_id = int(user_id)
             
@@ -31,20 +49,29 @@ class SaasAutoLoginController(http.Controller):
             admin = request.env['res.users'].sudo().search([('login', '=', 'admin')], limit=1)
             if not admin:
                 _logger.error("❌ Admin user not found")
-                return {'success': False, 'error': 'Admin not found'}
+                return request.make_json_response({
+                    'success': False, 
+                    'error': 'Admin not found'
+                })
             
             try:
                 admin.sudo()._check_credentials(admin_password, {'interactive': False})
                 _logger.info("✅ Admin password verified")
             except Exception as e:
                 _logger.error("❌ Wrong admin password: %s", str(e))
-                return {'success': False, 'error': 'Wrong admin password'}
+                return request.make_json_response({
+                    'success': False, 
+                    'error': 'Wrong admin password'
+                })
             
             # التحقق من المستخدم
             user = request.env['res.users'].sudo().browse(user_id)
             if not user.exists():
                 _logger.error("❌ User not found: %d", user_id)
-                return {'success': False, 'error': 'User not found'}
+                return request.make_json_response({
+                    'success': False, 
+                    'error': 'User not found'
+                })
             
             # توليد token آمن
             token = secrets.token_urlsafe(40)
@@ -63,18 +90,21 @@ class SaasAutoLoginController(http.Controller):
             base = request.httprequest.host_url.rstrip('/')
             auth_url = f"{base}/saas/autologin?token={token}"
             
-            return {
+            return request.make_json_response({
                 'success': True,
                 'auth_url': auth_url,
                 'token': token,
                 'expires_at': expires.isoformat()
-            }
+            })
             
         except Exception as e:
             _logger.error("❌ Generate link failed: %s", str(e), exc_info=True)
-            return {'success': False, 'error': str(e)}
+            return request.make_json_response({
+                'success': False, 
+                'error': str(e)
+            })
 
-    @http.route('/saas/autologin', type='http', auth='none', methods=['GET'], csrf=False, website=True)
+    @http.route('/saas/autologin', type='http', auth='none', methods=['GET'], csrf=False)
     def autologin(self, token, **kwargs):
         """تسجيل الدخول التلقائي باستخدام الـ token"""
         try:
@@ -97,6 +127,7 @@ class SaasAutoLoginController(http.Controller):
             
             user_id = data['user_id']
             user_login = data['user_login']
+            db_name = data['db_name']
             
             user = request.env['res.users'].sudo().browse(user_id)
             if not user.exists() or not user.active:
@@ -110,27 +141,26 @@ class SaasAutoLoginController(http.Controller):
             del TOKEN_STORAGE[token]
             _logger.info("🗑️ Token used and deleted")
             
-            # 🎯 الحل الصحيح: تسجيل الدخول باستخدام request.session.authenticate
-            db_name = request.env.cr.dbname
-            
-            # طريقة 1: استخدام authenticate (الأفضل)
-            request.session.authenticate(db_name, user_login, user_login)
+            # 🎯 تسجيل الدخول
             request.session.uid = user_id
+            request.session.login = user_login
+            request.session.db = db_name
+            request.session.session_token = secrets.token_hex(16)
             
-            # تحديث الـ context
-            request.session.context = dict(request.session.context or {})
-            request.session.context.update({
+            request.session.context = {
                 'lang': user.lang or 'en_US',
                 'tz': user.tz or 'UTC',
                 'uid': user_id,
-            })
+            }
             
             # تحديث environment
             request.uid = user_id
             
+            # حفظ الـ session
+            request.session.modified = True
+            
             _logger.info("✅✅✅ Autologin SUCCESS for user: %s (ID: %d)", user_login, user_id)
             
-            # إعادة التوجيه إلى الصفحة الرئيسية
             return werkzeug.utils.redirect('/web', 303)
             
         except Exception as e:
