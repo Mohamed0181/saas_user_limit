@@ -155,22 +155,28 @@ class SaasAutoLoginController(http.Controller):
             _logger.info("🗑️ Token deleted after use")
             
             # ✅✅✅ تسجيل الدخول في Odoo 18
-            # يجب تعيين جميع خصائص الـ session بشكل صحيح
+            # الخطوة 1: تنظيف الـ session القديم
+            request.session.logout(keep_db=True)
+            
+            # الخطوة 2: تعيين جميع خصائص الـ session
             request.session.uid = user_id
             request.session.login = user_login
             request.session.db = db_name
             
-            # ✅ CRITICAL: إنشاء session_token (مطلوب في Odoo 18)
+            # الخطوة 3: CRITICAL - إنشاء session_token (مطلوب في Odoo 18)
             request.session.session_token = secrets.token_hex(16)
             
-            # ✅ تعيين الـ context
+            # الخطوة 4: تعيين الـ context
             request.session.context = {
                 'lang': user.lang or 'en_US',
                 'tz': user.tz or 'UTC',
                 'uid': user_id,
             }
             
-            # ✅ تحديث الـ environment
+            # الخطوة 5: حفظ الـ session
+            request.session.finalize()
+            
+            # الخطوة 6: تحديث الـ environment
             request.update_env(user=user_id)
             
             _logger.info("✅✅✅ Autologin SUCCESS for user: %s (ID: %d)", user_login, user_id)
