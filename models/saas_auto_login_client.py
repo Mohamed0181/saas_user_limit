@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-from odoo import http
+from odoo import http, fields
 from odoo.http import request
 import logging
 from datetime import datetime
@@ -41,17 +41,22 @@ class SaasClientLoginController(http.Controller):
             user = result['user']
             
             try:
-                # إنشاء session
-                request.session.authenticate(
-                    request.env.cr.dbname,
-                    user.login,
-                    user.id
-                )
+                # ✅ الطريقة الصحيحة لـ Odoo 18
+                request.session.uid = user.id
+                request.session.login = user.login
+                request.session.session_token = request.session.sid
+                
+                # تحديث الـ context
+                user_context = request.env['res.users'].sudo().browse(user.id).context_get()
+                request.session.context = dict(user_context)
+                
+                # تحديث الـ environment
+                request.update_env(user=user.id)
                 
                 _logger.info("✅ User logged in successfully: %s (ID: %s)", user.login, user.id)
                 
                 # تحديث last login
-                user.sudo().write({'login_date': datetime.now()})
+                user.sudo().write({'login_date': fields.Datetime.now()})
 
             except Exception as e:
                 _logger.error("❌ Failed to create session: %s", str(e), exc_info=True)
@@ -325,58 +330,68 @@ class SaasClientLoginController(http.Controller):
                 @keyframes shake {{
                     0%, 100% {{ transform: translateX(0); }}
                     25% {{ transform: translateX(-10px); }}
-                    75% {{ transform: translateX(10px); }}
+                    50% {{ transform: translateX(10px); }}
+                    75% {{ transform: translateX(-10px); }}
                 }}
                 h1 {{
-                    color: #d32f2f;
-                    margin-bottom: 10px;
-                    font-size: 24px;
+                    color: #e53935;
+                    margin-bottom: 15px;
+                    font-size: 28px;
+                    font-weight: 600;
                 }}
                 .error-code {{
-                    color: #666;
+                    color: #999;
                     font-size: 14px;
                     margin-bottom: 20px;
-                    font-family: 'Courier New', monospace;
+                    font-family: monospace;
                 }}
                 .error-message {{
                     color: #555;
-                    margin-bottom: 30px;
+                    font-size: 16px;
                     line-height: 1.6;
-                    padding: 15px;
-                    background: #f5f5f5;
+                    margin-bottom: 30px;
+                    padding: 20px;
+                    background: #fff3f3;
                     border-radius: 8px;
-                    border-left: 4px solid #d32f2f;
-                    text-align: left;
+                    border-left: 4px solid #e53935;
                 }}
-                .help-text {{
+                .help-section {{
+                    background: #f5f5f5;
+                    padding: 20px;
+                    border-radius: 8px;
+                    margin-bottom: 20px;
+                }}
+                .help-section h3 {{
+                    color: #666;
+                    font-size: 14px;
+                    margin-bottom: 10px;
+                    font-weight: 500;
+                }}
+                .help-section p {{
                     color: #888;
                     font-size: 13px;
-                    margin-top: 20px;
-                    padding: 10px;
-                    background: #f9f9f9;
-                    border-radius: 6px;
+                    line-height: 1.5;
                 }}
-                .btn {{
+                .action-button {{
                     display: inline-block;
                     padding: 12px 30px;
-                    margin: 10px 5px;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
                     text-decoration: none;
                     border-radius: 25px;
                     font-weight: 500;
                     transition: all 0.3s;
+                    margin: 5px;
                 }}
-                .btn-primary {{
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    color: white;
-                }}
-                .btn-primary:hover {{
+                .action-button:hover {{
                     transform: translateY(-2px);
                     box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
                 }}
                 .timestamp {{
-                    margin-top: 20px;
+                    color: #aaa;
                     font-size: 12px;
-                    color: #999;
+                    margin-top: 20px;
+                    font-family: monospace;
                 }}
             </style>
         </head>
@@ -385,12 +400,14 @@ class SaasClientLoginController(http.Controller):
                 <div class="error-icon">❌</div>
                 <h1>Login Failed</h1>
                 <div class="error-code">Error Code: {code}</div>
-                <div class="error-message">{message}</div>
-                <div class="help-text">
-                    💡 <strong>Need help?</strong><br>
-                    Please request a new login link from your administrator.
+                <div class="error-message">
+                    {message}
                 </div>
-                <a href="/web/login" class="btn btn-primary">Go to Login Page</a>
+                <div class="help-section">
+                    <h3>💡 Need help?</h3>
+                    <p>Please request a new login link from your administrator.</p>
+                </div>
+                <a href="/web/login" class="action-button">Go to Login Page</a>
                 <div class="timestamp">Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
             </div>
         </body>
@@ -404,67 +421,3 @@ class SaasClientLoginController(http.Controller):
             ],
             status=code
         )
-
-
-class SaasClientManagementController(http.Controller):
-    """
-    Controllers إضافية لإدارة العميل
-    """
-
-    @http.route('/saas/cleanup_tokens', type='json', auth='user', methods=['POST'])
-    def cleanup_expired_tokens(self, **kwargs):
-        """تنظيف يدوي للـ tokens المنتهية"""
-        try:
-            if not request.env.user.has_group('base.group_system'):
-                return {'success': False, 'error': 'Unauthorized'}
-
-            token_manager = request.env['saas.client.token.manager']
-            result = token_manager.cleanup_expired_tokens()
-            
-            return {
-                'success': True,
-                'result': result
-            }
-            
-        except Exception as e:
-            _logger.error("❌ Cleanup failed: %s", str(e), exc_info=True)
-            return {'success': False, 'error': str(e)}
-
-    @http.route('/saas/token_stats', type='json', auth='user', methods=['POST'])
-    def get_token_stats(self, **kwargs):
-        """الحصول على إحصائيات الـ Tokens"""
-        try:
-            if not request.env.user.has_group('base.group_system'):
-                return {'success': False, 'error': 'Unauthorized'}
-
-            token_manager = request.env['saas.client.token.manager']
-            stats = token_manager.get_token_stats()
-            
-            return {
-                'success': True,
-                'stats': stats
-            }
-            
-        except Exception as e:
-            return {'success': False, 'error': str(e)}
-
-    @http.route('/saas/health', type='http', auth='public', website=False, csrf=False)
-    def health_check(self, **kwargs):
-        """Health check endpoint"""
-        try:
-            # فحص الاتصال بقاعدة البيانات
-            request.env.cr.execute("SELECT 1")
-            
-            return request.make_response(
-                '{"status": "healthy", "database": "%s", "timestamp": "%s"}' % (
-                    request.env.cr.dbname,
-                    datetime.now().isoformat()
-                ),
-                headers=[('Content-Type', 'application/json')]
-            )
-        except Exception as e:
-            return request.make_response(
-                '{"status": "unhealthy", "error": "%s"}' % str(e),
-                headers=[('Content-Type', 'application/json')],
-                status=500
-            )
