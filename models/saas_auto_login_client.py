@@ -1,9 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-ملف Controller يجب أن يكون في:
+ملف Controller - يوضع في:
 controllers/saas_auto_login_client.py
-أو
-models/saas_auto_login_client.py (حسب موقعه الحالي)
 """
 from odoo import http
 from odoo.http import request
@@ -24,19 +22,28 @@ class SaasAutoLoginController(http.Controller):
     def generate_auth_link(self, **kwargs):
         """توليد رابط تسجيل دخول تلقائي"""
         try:
-            # قراءة البيانات
+            # ✅ قراءة البيانات بطريقة صحيحة
+            user_id = None
+            admin_password = None
+            
+            # محاولة قراءة JSON من body
             if request.httprequest.data:
-                data = json.loads(request.httprequest.data.decode('utf-8'))
-                params = data.get('params', data)
-                user_id = params.get('user_id')
-                admin_password = params.get('admin_password')
-            else:
+                try:
+                    data = json.loads(request.httprequest.data.decode('utf-8'))
+                    user_id = data.get('user_id')
+                    admin_password = data.get('admin_password')
+                    _logger.info("📥 Data from JSON body: user_id=%s", user_id)
+                except:
+                    pass
+            
+            # إذا لم تُقرأ من JSON، جرّب kwargs
+            if not user_id:
                 user_id = kwargs.get('user_id')
                 admin_password = kwargs.get('admin_password')
-            
-            _logger.info("🔍 Request received - user_id: %s", user_id)
+                _logger.info("📥 Data from kwargs: user_id=%s", user_id)
             
             if not user_id or not admin_password:
+                _logger.error("❌ Missing user_id or admin_password")
                 return request.make_json_response({
                     'success': False, 
                     'error': 'Missing user_id or admin_password'
@@ -45,7 +52,7 @@ class SaasAutoLoginController(http.Controller):
             user_id = int(user_id)
             current_db = request.env.cr.dbname
             
-            # ✅ التحقق من المستخدم المطلوب أولاً
+            # ✅ التحقق من المستخدم
             user = request.env['res.users'].sudo().browse(user_id)
             if not user.exists():
                 _logger.error("❌ User ID %d not found", user_id)
@@ -61,11 +68,24 @@ class SaasAutoLoginController(http.Controller):
                     'error': 'User is inactive'
                 })
             
-            # ✅ بدون التحقق من كلمة سر Admin - مباشرة توليد Token
-            # نفترض أن الطلب قادم من Manager موثوق
+            # ✅ التحقق من كلمة مرور الأدمن (اختياري حسب احتياجك)
+            # يمكنك تفعيل هذا للأمان الإضافي:
+            """
+            admin = request.env['res.users'].sudo().search([('id', '=', 2)], limit=1)  # SUPERUSER_ID = 2
+            if admin:
+                try:
+                    admin.sudo()._check_credentials(admin_password, {'interactive': False})
+                except:
+                    _logger.error("❌ Invalid admin password")
+                    return request.make_json_response({
+                        'success': False,
+                        'error': 'Invalid admin password'
+                    })
+            """
+            
             _logger.info("⚠️ Skipping admin password check - trusted source")
             
-            # توليد token آمن
+            # ✅ توليد token آمن
             token = secrets.token_urlsafe(40)
             expires = datetime.now() + timedelta(minutes=10)
             
@@ -97,10 +117,11 @@ class SaasAutoLoginController(http.Controller):
 
     @http.route('/saas/autologin', type='http', auth='public', methods=['GET'], csrf=False)
     def autologin(self, token, **kwargs):
-        """تسجيل الدخول التلقائي"""
+        """تسجيل الدخول التلقائي - محدّث لـ Odoo 17"""
         try:
-            _logger.info("🔑 Autologin with token: %s...", token[:10])
+            _logger.info("🔑 Autologin attempt with token: %s...", token[:10])
             
+            # ✅ التحقق من Token
             data = TOKEN_STORAGE.get(token)
             
             if not data:
@@ -120,32 +141,29 @@ class SaasAutoLoginController(http.Controller):
             user_login = data['user_login']
             db_name = data['db_name']
             
+            # ✅ التحقق من المستخدم مرة أخرى
             user = request.env['res.users'].sudo().browse(user_id)
             if not user.exists() or not user.active:
                 del TOKEN_STORAGE[token]
+                _logger.error("❌ User not found or inactive")
                 return request.render('web.login', {
-                    'error': 'المستخدم غير موجود'
+                    'error': 'المستخدم غير موجود أو غير نشط'
                 })
             
+            # ✅ حذف الـ token بعد الاستخدام
             del TOKEN_STORAGE[token]
-            _logger.info("🗑️ Token deleted")
+            _logger.info("🗑️ Token deleted after use")
             
-            # 🎯 تسجيل الدخول
-            request.session.uid = user_id
-            request.session.login = user_login
-            request.session.db = db_name
-            request.session.session_token = secrets.token_hex(16)
-            request.session.context = {
-                'lang': user.lang or 'en_US',
-                'tz': user.tz or 'UTC',
-                'uid': user_id,
-            }
+            # ✅✅✅ الطريقة الصحيحة لـ Odoo 17+
+            request.session.authenticate(db_name, user_login, None, user_id=user_id)
             
-            request.uid = user_id
-            request.session.modified = True
+            # أو استخدم هذه الطريقة البديلة:
+            # request.session.uid = user_id
+            # request.update_env(user=user_id)
             
-            _logger.info("✅✅✅ Autologin SUCCESS for %s", user_login)
+            _logger.info("✅✅✅ Autologin SUCCESS for user: %s (ID: %d)", user_login, user_id)
             
+            # ✅ إعادة التوجيه للصفحة الرئيسية
             return werkzeug.utils.redirect('/web', 303)
             
         except Exception as e:
@@ -156,10 +174,18 @@ class SaasAutoLoginController(http.Controller):
 
     @http.route('/saas/cleanup_tokens', type='json', auth='user', methods=['POST'])
     def cleanup_expired_tokens(self):
-        """تنظيف tokens"""
-        now = datetime.now()
-        expired = [k for k, v in TOKEN_STORAGE.items() if v['expires'] < now]
-        for token in expired:
-            del TOKEN_STORAGE[token]
-        _logger.info("🧹 Cleaned %d tokens", len(expired))
-        return {'cleaned': len(expired), 'remaining': len(TOKEN_STORAGE)}
+        """تنظيف الـ tokens المنتهية"""
+        try:
+            now = datetime.now()
+            expired = [k for k, v in TOKEN_STORAGE.items() if v['expires'] < now]
+            for token in expired:
+                del TOKEN_STORAGE[token]
+            _logger.info("🧹 Cleaned %d expired tokens", len(expired))
+            return {
+                'success': True,
+                'cleaned': len(expired), 
+                'remaining': len(TOKEN_STORAGE)
+            }
+        except Exception as e:
+            _logger.error("❌ Cleanup failed: %s", str(e))
+            return {'success': False, 'error': str(e)}
