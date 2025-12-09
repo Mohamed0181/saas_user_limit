@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 {
-    'name': 'saas base 1',
+    'name': 'saas base 2',
     'category': 'Odoo Management',
     'summary': 'Control odoo',
     'author': 'Optimum Smart Solutions',
