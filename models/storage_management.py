@@ -101,28 +101,38 @@ class IrAttachmentStorageEnforcer(models.Model):
         return super().create(vals_list)
 
 
-class MailMessageStorageEnforcer(models.Model):
-    """Block messages with attachments"""
-    _inherit = 'mail.message'
+# ==================== OPTIONAL: Mail Message Enforcement ====================
+# Only if 'mail' module is installed
 
-    @api.model_create_multi
-    def create(self, vals_list):
-        """Block messages with attachments if quota exceeded"""
-        ICP = self.env['ir.config_parameter'].sudo()
-        readonly_mode = ICP.get_param('storage.readonly_mode', 'false')
-        
-        if readonly_mode == 'true':
-            # Check if any message has attachments
-            for vals in vals_list:
-                if vals.get('attachment_ids'):
-                    raise UserError(_(
-                        "⛔ CANNOT SEND MESSAGE WITH ATTACHMENTS\n\n"
-                        "Storage quota exceeded.\n"
-                        "You can send text messages only.\n\n"
-                        "To send attachments, contact administrator to upgrade."
-                    ))
-        
-        return super().create(vals_list)
+try:
+    from odoo.addons.mail.models.mail_message import Message
+    
+    class MailMessageStorageEnforcer(models.Model):
+        """Block messages with attachments - OPTIONAL"""
+        _inherit = 'mail.message'
+
+        @api.model_create_multi
+        def create(self, vals_list):
+            """Block messages with attachments if quota exceeded"""
+            ICP = self.env['ir.config_parameter'].sudo()
+            readonly_mode = ICP.get_param('storage.readonly_mode', 'false')
+            
+            if readonly_mode == 'true':
+                for vals in vals_list:
+                    if vals.get('attachment_ids'):
+                        raise UserError(_(
+                            "⛔ CANNOT SEND MESSAGE WITH ATTACHMENTS\n\n"
+                            "Storage quota exceeded.\n"
+                            "You can send text messages only.\n\n"
+                            "To send attachments, contact administrator to upgrade."
+                        ))
+            
+            return super().create(vals_list)
+            
+except ImportError:
+    # Mail module not installed - skip
+    _logger.info("Mail module not installed - skipping mail.message enforcement")
+    pass
 
 
 class ResUsers(models.Model):
@@ -146,38 +156,5 @@ class ResUsers(models.Model):
                 )
         except Exception as e:
             _logger.error("Error checking readonly mode on login: %s", str(e))
-        
-        return result
-
-
-# ==================== OPTIONAL: Show Banner via res.users ====================
-
-class ResUsersInherit(models.Model):
-    _inherit = 'res.users'
-    
-    @api.model
-    def systray_get_activities(self):
-        """Add storage warning to systray"""
-        result = super().systray_get_activities()
-        
-        try:
-            ICP = self.env['ir.config_parameter'].sudo()
-            readonly_mode = ICP.get_param('storage.readonly_mode', 'false')
-            
-            if readonly_mode == 'true':
-                # Add warning to systray
-                result.append({
-                    'type': 'storage_warning',
-                    'name': 'Storage Quota Exceeded',
-                    'model': 'ir.config_parameter',
-                    'icon': 'fa-exclamation-triangle',
-                    'total_count': 1,
-                    'actions': [{
-                        'icon': 'fa-warning',
-                        'name': 'READ-ONLY MODE: Storage quota exceeded'
-                    }]
-                })
-        except Exception as e:
-            _logger.error("Error adding storage warning to systray: %s", str(e))
         
         return result
