@@ -1,8 +1,8 @@
 # models/storage_quota_enforcer.py
-# هذا الموديل ينزل مع كل عميل ويمنعه من الكتابة
+# حل بدون XML - يمنع العميل مباشرة
 
 from odoo import models, api, _
-from odoo.exceptions import AccessError
+from odoo.exceptions import AccessError, UserError
 import logging
 
 _logger = logging.getLogger(__name__)
@@ -10,63 +10,75 @@ _logger = logging.getLogger(__name__)
 
 class BaseModelStorageEnforcer(models.AbstractModel):
     """
-    هذا الموديل يتم inherit في كل Models
-    ويمنع العميل من Create/Write/Unlink لو المساحة ممتلئة
+    Block all write operations when storage quota exceeded
+    NO XML NEEDED - Pure Python Solution
     """
     _inherit = 'base'
 
-    def _check_storage_quota(self):
-        """Check if storage quota is exceeded"""
+    @api.model
+    def _check_storage_quota_before_write(self):
+        """Check storage quota and block if exceeded"""
         try:
-            # Get readonly mode from system parameters
             ICP = self.env['ir.config_parameter'].sudo()
             readonly_mode = ICP.get_param('storage.readonly_mode', 'false')
             
             if readonly_mode == 'true':
-                # Get quota info
-                quota_info = ICP.get_param('storage.quota_info', '')
+                quota_info = ICP.get_param('storage.quota_info', 
+                    'Storage quota exceeded. Contact administrator.')
                 
-                raise AccessError(_(
-                    "⛔ STORAGE QUOTA EXCEEDED - READ-ONLY MODE\n\n"
+                raise UserError(_(
+                    "⛔ OPERATION BLOCKED\n\n"
                     "%s\n\n"
-                    "You cannot create, edit or delete records.\n"
-                    "Please contact your administrator to upgrade your storage plan."
-                ) % (quota_info or "Your storage quota has been exceeded"))
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "READ-ONLY MODE ACTIVE\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "You can:\n"
+                    "✓ View records\n"
+                    "✓ Search and filter\n"
+                    "✓ Generate reports\n"
+                    "✓ Delete records (to free space)\n\n"
+                    "You CANNOT:\n"
+                    "✗ Create new records\n"
+                    "✗ Edit existing records\n"
+                    "✗ Upload files\n\n"
+                    "Contact your administrator to upgrade your storage plan."
+                ) % quota_info)
             
-            return True
-            
-        except AccessError:
+        except UserError:
+            # Re-raise UserError
             raise
         except Exception as e:
-            # If check fails, allow operation (don't block normal operations)
+            # Log error but don't block operation
             _logger.warning("Storage quota check failed: %s", str(e))
-            return True
+            pass
 
     @api.model_create_multi
     def create(self, vals_list):
-        """Override create to check storage quota"""
-        # Check quota before creating
-        self._check_storage_quota()
-        return super(BaseModelStorageEnforcer, self).create(vals_list)
+        """Block create if quota exceeded"""
+        # Skip check for system models
+        if self._name in ['ir.config_parameter', 'ir.logging', 'bus.bus']:
+            return super().create(vals_list)
+        
+        self._check_storage_quota_before_write()
+        return super().create(vals_list)
 
     def write(self, vals):
-        """Override write to check storage quota"""
-        # Check quota before writing
-        self._check_storage_quota()
-        return super(BaseModelStorageEnforcer, self).write(vals)
+        """Block write if quota exceeded"""
+        # Skip check for system models
+        if self._name in ['ir.config_parameter', 'ir.logging', 'bus.bus']:
+            return super().write(vals)
+        
+        self._check_storage_quota_before_write()
+        return super().write(vals)
 
     def unlink(self):
-        """Override unlink to check storage quota"""
-        # Allow delete even in readonly mode (to free up space)
-        # If you want to block delete too, uncomment below:
-        # self._check_storage_quota()
-        return super(BaseModelStorageEnforcer, self).unlink()
+        """Allow delete even in readonly (to free space)"""
+        # Don't block delete - let users free up space
+        return super().unlink()
 
 
 class IrAttachmentStorageEnforcer(models.Model):
-    """
-    خاص بـ الملفات - منع رفع الملفات لو المساحة ممتلئة
-    """
+    """Block file uploads - Most important for storage"""
     _inherit = 'ir.attachment'
 
     @api.model_create_multi
@@ -76,20 +88,21 @@ class IrAttachmentStorageEnforcer(models.Model):
         readonly_mode = ICP.get_param('storage.readonly_mode', 'false')
         
         if readonly_mode == 'true':
-            raise AccessError(_(
+            raise UserError(_(
                 "⛔ FILE UPLOAD BLOCKED\n\n"
                 "Your storage quota has been exceeded.\n"
-                "Cannot upload new files.\n\n"
-                "Please contact your administrator to upgrade your storage plan."
+                "Cannot upload new files or attachments.\n\n"
+                "Please:\n"
+                "1. Delete unnecessary files, OR\n"
+                "2. Contact administrator to upgrade storage plan\n\n"
+                "Current Status: READ-ONLY MODE"
             ))
         
-        return super(IrAttachmentStorageEnforcer, self).create(vals_list)
+        return super().create(vals_list)
 
 
 class MailMessageStorageEnforcer(models.Model):
-    """
-    منع إرسال رسائل مع مرفقات لو المساحة ممتلئة
-    """
+    """Block messages with attachments"""
     _inherit = 'mail.message'
 
     @api.model_create_multi
@@ -99,55 +112,72 @@ class MailMessageStorageEnforcer(models.Model):
         readonly_mode = ICP.get_param('storage.readonly_mode', 'false')
         
         if readonly_mode == 'true':
-            # Check if message has attachments
+            # Check if any message has attachments
             for vals in vals_list:
                 if vals.get('attachment_ids'):
-                    raise AccessError(_(
+                    raise UserError(_(
                         "⛔ CANNOT SEND MESSAGE WITH ATTACHMENTS\n\n"
-                        "Your storage quota has been exceeded.\n"
-                        "You can send messages without attachments only.\n\n"
-                        "Please contact your administrator to upgrade your storage plan."
+                        "Storage quota exceeded.\n"
+                        "You can send text messages only.\n\n"
+                        "To send attachments, contact administrator to upgrade."
                     ))
         
-        return super(MailMessageStorageEnforcer, self).create(vals_list)
+        return super().create(vals_list)
 
 
-# ==================== Storage Banner Widget ====================
-
-class StorageQuotaBanner(models.TransientModel):
-    """
-    موديل لعرض Banner التحذير
-    """
-    _name = 'storage.quota.banner'
-    _description = 'Storage Quota Warning Banner'
+class ResUsers(models.Model):
+    """Show notification to users on login"""
+    _inherit = 'res.users'
 
     @api.model
-    def get_banner_info(self):
-        """Get storage quota banner information"""
-        ICP = self.env['ir.config_parameter'].sudo()
-        readonly_mode = ICP.get_param('storage.readonly_mode', 'false')
+    def _check_credentials(self, password, user_agent_env):
+        """Check and notify on login if readonly mode"""
+        result = super()._check_credentials(password, user_agent_env)
         
-        if readonly_mode == 'true':
-            quota_info = ICP.get_param('storage.quota_info', '')
+        try:
+            ICP = self.env['ir.config_parameter'].sudo()
+            readonly_mode = ICP.get_param('storage.readonly_mode', 'false')
             
-            return {
-                'show_banner': True,
-                'message': quota_info or 'Storage quota exceeded - READ-ONLY MODE',
-                'type': 'danger'
-            }
+            if readonly_mode == 'true':
+                quota_info = ICP.get_param('storage.quota_info', '')
+                _logger.warning(
+                    "User %s logged in during READ-ONLY mode: %s",
+                    self.login, quota_info
+                )
+        except Exception as e:
+            _logger.error("Error checking readonly mode on login: %s", str(e))
         
-        # Check warning level
-        quota_percentage = float(ICP.get_param('storage.quota_percentage', '0'))
+        return result
+
+
+# ==================== OPTIONAL: Show Banner via res.users ====================
+
+class ResUsersInherit(models.Model):
+    _inherit = 'res.users'
+    
+    @api.model
+    def systray_get_activities(self):
+        """Add storage warning to systray"""
+        result = super().systray_get_activities()
         
-        if quota_percentage >= 90:
-            return {
-                'show_banner': True,
-                'message': f'⚠️ Storage warning: {quota_percentage:.1f}% used',
-                'type': 'warning'
-            }
+        try:
+            ICP = self.env['ir.config_parameter'].sudo()
+            readonly_mode = ICP.get_param('storage.readonly_mode', 'false')
+            
+            if readonly_mode == 'true':
+                # Add warning to systray
+                result.append({
+                    'type': 'storage_warning',
+                    'name': 'Storage Quota Exceeded',
+                    'model': 'ir.config_parameter',
+                    'icon': 'fa-exclamation-triangle',
+                    'total_count': 1,
+                    'actions': [{
+                        'icon': 'fa-warning',
+                        'name': 'READ-ONLY MODE: Storage quota exceeded'
+                    }]
+                })
+        except Exception as e:
+            _logger.error("Error adding storage warning to systray: %s", str(e))
         
-        return {
-            'show_banner': False,
-            'message': '',
-            'type': 'info'
-        }
+        return result
