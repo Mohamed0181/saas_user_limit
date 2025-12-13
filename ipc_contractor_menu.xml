@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<odoo>
+  <menuitem id="menu_ipc_root" name="IPC" sequence="10" web_icon="ipc_contractor,static/description/icon.png"/>
+  <!-- <menuitem id="menu_ipc_contractor" name="Contractor IPC" parent="menu_ipc_root" sequence="100"/>
+  <menuitem id="menu_ipc_contractor_items" name="IPC Certificates" parent="menu_ipc_contractor" action="action_ipc_contractor"/> -->
+
+</odoo>
