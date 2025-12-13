@@ -5,7 +5,7 @@
     'summary': 'Control odoo',
     'author': 'Optimum Smart Solutions',
     'license': 'LGPL-3',
-    'depends': ['base'],
+    'depends': ['base','mail'],
     'data': [
         'security/ir.model.access.csv',
         # 'view/storage_management_view.xml',
