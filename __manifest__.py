@@ -8,6 +8,7 @@
     'depends': ['base'],
     'data': [
         'security/ir.model.access.csv',
+        'view/storage_management_views.xml',
         
     ],
     'auto_install': False,  # تم تغيير التثبيت يدوى مؤقت لحين الانتهاء اً
